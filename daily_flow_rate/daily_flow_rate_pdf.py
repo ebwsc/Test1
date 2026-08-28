@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import re
+import traceback
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -55,6 +56,16 @@ LEAP_MONTH_LENGTHS = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
 EXPECTED_COLUMN_COUNT = 13
 EXPECTED_VERTICAL_RULE_COUNT = EXPECTED_COLUMN_COUNT + 1
 EXPECTED_DAY_COUNT = 31
+
+# Printed yearbooks use more than one vertical rhythm.  Some editions leave a
+# larger gap after every fifth day, others only after days 10 and 20, and a few
+# use an almost uniform 31-row body.  Treat these as competing form models
+# instead of forcing every page into the five-day layout.
+ANCHOR_RHYTHM_MODELS = (
+    ("five-day-groups", frozenset({5, 10, 15, 20, 25}), 1.82),
+    ("ten-day-groups", frozenset({10, 20}), 1.82),
+    ("uniform", frozenset(), 1.0),
+)
 
 NUMERIC_TRANSLATION = str.maketrans(
     {
@@ -127,6 +138,7 @@ class PageGeometry:
     )
     virtual_month_anchors: list[dict[str, Any]] = field(default_factory=list)
     month_lengths: list[int] = field(default_factory=list)
+    source_region_diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -139,6 +151,20 @@ class TableRegion:
     source_rules: list[int]
     source_components: list[dict[str, float]]
     image: np.ndarray
+    observed_rule_flags: list[bool] = field(default_factory=list)
+    rectified_rules: list[int] = field(default_factory=list)
+    rectified_boundaries: dict[str, int] = field(default_factory=dict)
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class TableRegionDetection:
+    """Accepted tables plus strong rejected candidates for resolution control."""
+
+    regions: list[TableRegion]
+    candidate_group_count: int
+    strong_rejected_candidate_count: int
+    rejected_groups: list[dict[str, Any]] = field(default_factory=list)
 
 
 def clustered_positions(values: list[float], tolerance: float) -> list[float]:
@@ -149,6 +175,463 @@ def clustered_positions(values: list[float], tolerance: float) -> list[float]:
         else:
             groups[-1].append(value)
     return [float(np.mean(group)) for group in groups]
+
+
+def vertical_rule_cluster_tolerance(image_width: int) -> float:
+    """Merge double edges and nearby fragments of one photographed rule."""
+
+    return max(5.0, image_width * 0.006)
+
+
+def merge_vertical_component_fragments(
+    components: list[dict[str, float]], image_height: int, image_width: int
+) -> list[dict[str, float]]:
+    """Join end-to-end pieces of one curved rule before lattice selection."""
+
+    if len(components) < 2:
+        return components
+    # A photographed rule can drift sideways while remaining one continuous
+    # curve.  The former 0.9%-page tolerance left the two ends of test22's
+    # right border as separate "rules".  1.6% is still far below half of a
+    # genuine month-column pitch, while accommodating ordinary page curl.
+    x_tolerance = max(7.0, image_width * 0.016)
+    minimum_gap = -image_height * 0.015
+    # Only locally neighbouring pieces may join.  A wider gap can accidentally
+    # connect the corresponding rule of two stacked tables on one page.
+    maximum_gap = image_height * 0.018
+    parent = list(range(len(components)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left_index: int, right_index: int) -> None:
+        left_root = find(left_index)
+        right_root = find(right_index)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    for left_index, left in enumerate(components[:-1]):
+        for right_index in range(left_index + 1, len(components)):
+            right = components[right_index]
+            if abs(left["x"] - right["x"]) > x_tolerance:
+                continue
+            vertical_gap = max(left["y"], right["y"]) - min(
+                left["bottom"], right["bottom"]
+            ) - 1.0
+            if minimum_gap <= vertical_gap <= maximum_gap:
+                union(left_index, right_index)
+
+    groups: dict[int, list[dict[str, float]]] = {}
+    for index, component in enumerate(components):
+        groups.setdefault(find(index), []).append(component)
+    merged: list[dict[str, float]] = []
+    for fragments in groups.values():
+        if len(fragments) == 1:
+            item = dict(fragments[0])
+            item["fragment_count"] = float(item.get("fragment_count", 1.0))
+            item["contains_core"] = bool(
+                item.get("contains_core", item.get("is_core", False))
+            )
+            merged.append(item)
+            continue
+        top = min(item["y"] for item in fragments)
+        bottom = max(item["bottom"] for item in fragments)
+        left_edge = min(item["left"] for item in fragments)
+        right_edge = max(item["right"] for item in fragments)
+        core_fragments = [
+            item
+            for item in fragments
+            if bool(item.get("contains_core", item.get("is_core", False)))
+        ]
+        core_top = (
+            min(float(item.get("core_top", item["y"])) for item in core_fragments)
+            if core_fragments
+            else None
+        )
+        core_bottom = (
+            max(
+                float(item.get("core_bottom", item["bottom"]))
+                for item in core_fragments
+            )
+            if core_fragments
+            else None
+        )
+        # Auxiliary pieces establish continuity, but their centroids can come
+        # from nearby digit strokes.  The lattice x coordinate must remain
+        # anchored to the original long/core pieces.
+        x_fragments = core_fragments or fragments
+        x_weights = np.asarray(
+            [float(item["height"]) for item in x_fragments], dtype=float
+        )
+        merged.append(
+            {
+                "x": float(
+                    np.average(
+                        np.asarray([item["x"] for item in x_fragments], dtype=float),
+                        weights=np.maximum(x_weights, 1.0),
+                    )
+                ),
+                "y": float(top),
+                "height": float(bottom - top + 1.0),
+                "bottom": float(bottom),
+                "center_y": float((top + bottom) / 2.0),
+                "area": float(sum(item["area"] for item in fragments)),
+                "left": float(left_edge),
+                "right": float(right_edge),
+                "width": float(right_edge - left_edge + 1.0),
+                "fragment_count": float(len(fragments)),
+                "contains_core": bool(
+                    any(
+                        item.get("contains_core", item.get("is_core", False))
+                        for item in fragments
+                    )
+                ),
+                "core_top": core_top,
+                "core_bottom": core_bottom,
+                "core_height": (
+                    None
+                    if core_top is None or core_bottom is None
+                    else float(core_bottom - core_top + 1.0)
+                ),
+            }
+        )
+    return merged
+
+
+def composite_vertical_rule_evidence(
+    components: list[dict[str, float]],
+    rule_x: float,
+    match_tolerance: float,
+    pitch: float,
+) -> tuple[dict[str, float], float]:
+    """Aggregate vertically separated pieces of one locally curved rule.
+
+    Connected-component centroids are only a 2-D summary of a photographed
+    curve.  Its upper and lower pieces may therefore have different x values.
+    Evidence is combined inside a guarded tube narrower than half a column;
+    neighbouring month rules can never enter the same tube.
+    """
+
+    if not components:
+        raise RuntimeError("竖线证据为空。")
+    tube_radius = max(match_tolerance, pitch * 0.34)
+    pieces = [
+        item
+        for item in components
+        if abs(float(item["x"]) - float(rule_x)) <= tube_radius
+    ]
+    if not pieces:
+        nearest = min(
+            components, key=lambda item: abs(float(item["x"]) - float(rule_x))
+        )
+        pieces = [nearest]
+    # A photographed page edge can run nearly parallel to the real outer rule
+    # inside the same x tube.  Such components overlap for most of their height
+    # and are alternatives, not fragments of one curve.  Aggregate only pieces
+    # that are vertically complementary; otherwise keep the component nearest
+    # to the proposed track.  This retains split curved rules while preventing
+    # a nearby book/page edge from stretching the true outer-border interval.
+    if len(pieces) > 1:
+        ordered_pieces = sorted(
+            pieces,
+            key=lambda item: abs(float(item["x"]) - float(rule_x)),
+        )
+        coherent = [ordered_pieces[0]]
+        coherent_top = float(ordered_pieces[0]["y"])
+        coherent_bottom = float(
+            ordered_pieces[0].get(
+                "bottom",
+                coherent_top + float(ordered_pieces[0]["height"]) - 1.0,
+            )
+        )
+        for item in ordered_pieces[1:]:
+            item_top = float(item["y"])
+            item_bottom = float(
+                item.get("bottom", item_top + float(item["height"]) - 1.0)
+            )
+            overlap = max(
+                0.0,
+                min(coherent_bottom, item_bottom)
+                - max(coherent_top, item_top)
+                + 1.0,
+            )
+            shorter_height = max(
+                1.0,
+                min(
+                    coherent_bottom - coherent_top + 1.0,
+                    item_bottom - item_top + 1.0,
+                ),
+            )
+            if overlap / shorter_height >= 0.55:
+                continue
+            vertical_gap = max(coherent_top, item_top) - min(
+                coherent_bottom, item_bottom
+            ) - 1.0
+            if vertical_gap > pitch * 0.65:
+                continue
+            coherent.append(item)
+            coherent_top = min(coherent_top, item_top)
+            coherent_bottom = max(coherent_bottom, item_bottom)
+        pieces = coherent
+    minimum_distance = min(
+        abs(float(item["x"]) - float(rule_x)) for item in pieces
+    )
+    weights = np.asarray(
+        [max(1.0, float(item.get("height", 1.0))) for item in pieces],
+        dtype=float,
+    )
+    top = min(float(item["y"]) for item in pieces)
+    bottom = max(
+        float(
+            item.get(
+                "bottom", float(item["y"]) + float(item["height"]) - 1.0
+            )
+        )
+        for item in pieces
+    )
+    left_edge = min(float(item.get("left", item["x"])) for item in pieces)
+    right_edge = max(float(item.get("right", item["x"])) for item in pieces)
+    core_pieces = [
+        item
+        for item in pieces
+        if item.get("core_top") is not None and item.get("core_bottom") is not None
+    ]
+    core_top = (
+        min(float(item["core_top"]) for item in core_pieces)
+        if core_pieces
+        else None
+    )
+    core_bottom = (
+        max(float(item["core_bottom"]) for item in core_pieces)
+        if core_pieces
+        else None
+    )
+    return (
+        {
+            "x": float(
+                np.average(
+                    np.asarray([float(item["x"]) for item in pieces]),
+                    weights=weights,
+                )
+            ),
+            "y": float(top),
+            "height": float(bottom - top + 1.0),
+            "bottom": float(bottom),
+            "center_y": float((top + bottom) / 2.0),
+            "area": float(sum(float(item.get("area", 0.0)) for item in pieces)),
+            "left": float(left_edge),
+            "right": float(right_edge),
+            "width": float(right_edge - left_edge + 1.0),
+            "fragment_count": float(
+                sum(float(item.get("fragment_count", 1.0)) for item in pieces)
+            ),
+            "evidence_piece_count": float(len(pieces)),
+            "contains_core": bool(core_pieces),
+            "core_top": core_top,
+            "core_bottom": core_bottom,
+            "core_height": (
+                None
+                if core_top is None or core_bottom is None
+                else float(core_bottom - core_top + 1.0)
+            ),
+        },
+        float(minimum_distance),
+    )
+
+
+def vertical_rule_candidate_metrics(
+    components: list[dict[str, float]],
+    rules: list[float] | np.ndarray,
+    match_tolerance: float,
+) -> dict[str, float]:
+    """Measure whether two endpoints look like one table's outer borders.
+
+    Equal spacing alone cannot distinguish a true table lattice from a shifted
+    lattice completed by a page edge, book spine, or nearby object.  Real outer
+    borders cover almost the same vertical interval and normally extend beyond
+    the internal month separators into the header/statistics bands.
+    """
+
+    rule_values = np.asarray(rules, dtype=float)
+    if len(rule_values) != EXPECTED_VERTICAL_RULE_COUNT or not components:
+        return {}
+
+    gaps = np.diff(rule_values)
+    pitch = float(np.median(gaps))
+
+    def nearest(value: float) -> tuple[dict[str, float], float]:
+        return composite_vertical_rule_evidence(
+            components, value, match_tolerance, pitch
+        )
+
+    left_component, left_distance = nearest(float(rule_values[0]))
+    right_component, right_distance = nearest(float(rule_values[-1]))
+
+    def interval(component: dict[str, float]) -> tuple[float, float, float]:
+        top = float(component["y"])
+        bottom = float(
+            component.get(
+                "bottom", top + float(component["height"]) - 1.0
+            )
+        )
+        height = max(1.0, bottom - top + 1.0)
+        return top, bottom, height
+
+    left_top, left_bottom, left_height = interval(left_component)
+    right_top, right_bottom, right_height = interval(right_component)
+    overlap = max(
+        0.0, min(left_bottom, right_bottom) - max(left_top, right_top) + 1.0
+    )
+    union = max(left_bottom, right_bottom) - min(left_top, right_top) + 1.0
+    interval_iou = overlap / max(1.0, union)
+    height_balance = min(left_height, right_height) / max(
+        left_height, right_height
+    )
+
+    internal_heights: list[float] = []
+    for value in rule_values[1:-1]:
+        component, distance = nearest(float(value))
+        if distance <= match_tolerance:
+            internal_heights.append(interval(component)[2])
+    if len(internal_heights) >= 4:
+        internal_height = float(np.median(internal_heights))
+    else:
+        internal_height = float(
+            np.median([interval(component)[2] for component in components])
+        )
+    minimum_relative_height = min(left_height, right_height) / max(
+        1.0, internal_height
+    )
+
+    month_gaps = gaps[1:]
+    month_gap_median = float(np.median(month_gaps))
+    month_gap_cv = float(
+        np.std(month_gaps) / max(1.0, float(np.mean(month_gaps)))
+    )
+    month_axis = np.arange(len(month_gaps), dtype=float)
+    if len(month_gaps) >= 3:
+        month_trend = np.polyval(
+            np.polyfit(month_axis, month_gaps, 1), month_axis
+        )
+        month_gap_trend_residual = float(
+            np.sqrt(np.mean(np.square(month_gaps - month_trend)))
+            / max(1.0, month_gap_median)
+        )
+    else:
+        month_gap_trend_residual = month_gap_cv
+    day_gap_ratio = float(gaps[0] / max(1.0, month_gap_median))
+
+    return {
+        "left_top": left_top,
+        "left_bottom": left_bottom,
+        "left_height": left_height,
+        "right_top": right_top,
+        "right_bottom": right_bottom,
+        "right_height": right_height,
+        "left_match_distance": left_distance,
+        "right_match_distance": right_distance,
+        "vertical_interval_iou": interval_iou,
+        "height_balance": height_balance,
+        "internal_height_median": internal_height,
+        "minimum_relative_height": minimum_relative_height,
+        "day_gap_ratio": day_gap_ratio,
+        "month_gap_cv": month_gap_cv,
+        "month_gap_trend_residual": month_gap_trend_residual,
+        "left_evidence_piece_count": float(
+            left_component.get("evidence_piece_count", 1.0)
+        ),
+        "right_evidence_piece_count": float(
+            right_component.get("evidence_piece_count", 1.0)
+        ),
+    }
+
+
+def passes_outer_border_topology(metrics: dict[str, float]) -> bool:
+    """Fail closed when two candidate endpoints do not form one outer frame."""
+
+    return bool(
+        metrics
+        and metrics["vertical_interval_iou"] >= 0.78
+        and metrics["height_balance"] >= 0.80
+        and metrics["minimum_relative_height"] >= 1.05
+        and 0.70 <= metrics["day_gap_ratio"] <= 1.45
+    )
+
+
+def passes_curved_outer_border_topology(metrics: dict[str, float]) -> bool:
+    """Guarded recovery when a curved outer border is only partly connected.
+
+    The relaxed interval test is allowed only when all thirteen column gaps
+    already form a very regular daily-flow lattice.  Thus a short photographed
+    outer fragment may be accepted, but an arbitrary page/object edge cannot
+    manufacture a table from spacing alone.
+    """
+
+    return bool(
+        metrics
+        and metrics["vertical_interval_iou"] >= 0.62
+        and metrics["height_balance"] >= 0.62
+        and metrics["minimum_relative_height"] >= 0.72
+        and 0.70 <= metrics["day_gap_ratio"] <= 1.45
+        and metrics["month_gap_cv"] <= 0.055
+        and metrics["month_gap_trend_residual"] <= 0.045
+    )
+
+
+def passes_one_sided_outer_completion(
+    matched: np.ndarray,
+    nearest: np.ndarray,
+    pitch: float,
+    topology: dict[str, float],
+) -> bool:
+    """Allow a strongly regular lattice whose far outer edge faded away.
+
+    Close photographs sometimes retain 10-13 consecutive rules from one outer
+    border while the opposite edge and a few adjacent month rules disappear in
+    glare or page curl.  This guarded path requires one *observed* outer border,
+    a contiguous run of at least ten tracks, no more than one internal hole and
+    at most four extrapolated tracks at the missing edge.  A shifted page edge
+    therefore cannot pass merely by matching the interior pitch.
+    """
+
+    if len(matched) != EXPECTED_VERTICAL_RULE_COUNT or not topology:
+        return False
+    left_observed = bool(matched[0])
+    right_observed = bool(matched[-1])
+    if left_observed == right_observed:
+        return False
+    observed_indices = np.flatnonzero(matched)
+    if observed_indices.size < 10:
+        return False
+    first = int(observed_indices[0])
+    last = int(observed_indices[-1])
+    if left_observed:
+        trailing_missing = EXPECTED_VERTICAL_RULE_COUNT - 1 - last
+        edge_missing = trailing_missing
+        internal_missing = int(np.count_nonzero(~matched[: last + 1]))
+        observed_height = float(topology["left_height"])
+    else:
+        edge_missing = first
+        internal_missing = int(np.count_nonzero(~matched[first:]))
+        observed_height = float(topology["right_height"])
+    residual = float(
+        np.median(nearest[matched]) / max(1.0, float(pitch))
+    )
+    relative_height = observed_height / max(
+        1.0, float(topology["internal_height_median"])
+    )
+    return bool(
+        1 <= edge_missing <= 4
+        and internal_missing <= 1
+        and residual <= 0.13
+        and relative_height >= 1.02
+        and 0.70 <= float(topology["day_gap_ratio"]) <= 1.45
+        and float(topology["month_gap_cv"]) <= 0.065
+        and float(topology["month_gap_trend_residual"]) <= 0.055
+    )
 
 
 def render_pdf_page(pdf_path: Path, page_index: int, width: int) -> np.ndarray:
@@ -175,27 +658,362 @@ def adaptive_ink(gray: np.ndarray) -> np.ndarray:
     )
 
 
-def detect_table_regions(image: np.ndarray, page_number: int) -> list[TableRegion]:
-    """Find every 14-rule daily-flow table on one page."""
+def select_or_complete_regular_vertical_rules(
+    components: list[dict[str, float]], image_width: int
+) -> tuple[list[int], list[bool], dict[str, Any]]:
+    """Select a 14-rule lattice while retaining weak, fragmented rules.
+
+    A photographed curved rule is often split into a shorter connected
+    component.  The old detector discarded the whole table when fewer than 14
+    *long* components survived.  Here the regular 13-column topology may fill
+    at most four internal tracks, but both outer borders must still be directly
+    observed.  This prevents desk/page edges from creating a table by
+    extrapolation alone.
+    """
+
+    tolerance = vertical_rule_cluster_tolerance(image_width)
+    positions = clustered_positions(
+        [float(item["x"]) for item in components], tolerance=tolerance
+    )
+    if len(positions) < 10:
+        raise RuntimeError(
+            f"仅检测到{len(positions)}条可用竖线片段，不能安全补全14条规则。"
+        )
+
+    # Preserve the proven exact path whenever fourteen complete positions are
+    # available.  The lattice fallback below is only used for fragmentation.
+    try:
+        exact = select_regular_vertical_rules(components, image_width)
+        exact_pitch = float(np.median(np.diff(np.asarray(exact, dtype=float))))
+        exact_topology = vertical_rule_candidate_metrics(
+            components,
+            exact,
+            max(tolerance * 1.6, exact_pitch * 0.14),
+        )
+        observed = [
+            min(abs(float(value) - position) for position in positions)
+            <= max(tolerance * 1.5, exact_pitch * 0.14)
+            for value in exact
+        ]
+        return exact, observed, {
+            "method": (
+                "complete-components"
+                if passes_outer_border_topology(exact_topology)
+                else "complete-components-curved-outer"
+            ),
+            "observed_position_count": len(positions),
+            "inferred_rule_indices": [
+                index for index, flag in enumerate(observed) if not flag
+            ],
+        }
+    except RuntimeError:
+        pass
+
+    minimum_pitch = image_width * 0.025
+    maximum_pitch = image_width * 0.105
+    model_keys: set[tuple[int, int]] = set()
+    models: list[tuple[float, float]] = []
+    for left_index in range(len(positions) - 1):
+        for right_index in range(left_index + 1, len(positions)):
+            separation = positions[right_index] - positions[left_index]
+            for logical_steps in range(1, EXPECTED_VERTICAL_RULE_COUNT):
+                pitch = separation / logical_steps
+                if not minimum_pitch <= pitch <= maximum_pitch:
+                    continue
+                for logical_left in range(
+                    EXPECTED_VERTICAL_RULE_COUNT - logical_steps
+                ):
+                    start = positions[left_index] - logical_left * pitch
+                    end = start + (EXPECTED_VERTICAL_RULE_COUNT - 1) * pitch
+                    if start < -pitch * 0.15 or end > image_width + pitch * 0.15:
+                        continue
+                    key = (round(start / 1.5), round(pitch / 0.35))
+                    if key not in model_keys:
+                        model_keys.add(key)
+                        models.append((start, pitch))
+
+    candidates: list[
+        tuple[tuple[float, ...], np.ndarray, np.ndarray, bool]
+    ] = []
+    observed_positions = np.asarray(positions, dtype=float)
+
+    for start, pitch in models:
+        grid = start + np.arange(EXPECTED_VERTICAL_RULE_COUNT, dtype=float) * pitch
+        nearest = np.min(
+            np.abs(grid[:, None] - observed_positions[None, :]), axis=1
+        )
+        match_tolerance = max(tolerance * 1.6, pitch * 0.14)
+        matched = nearest <= match_tolerance
+        match_count = int(np.count_nonzero(matched))
+        if match_count < 10:
+            continue
+        topology = vertical_rule_candidate_metrics(
+            components, grid, match_tolerance
+        )
+        ordinary_topology = bool(
+            bool(matched[0])
+            and bool(matched[-1])
+            and (
+                passes_outer_border_topology(topology)
+                or (
+                    match_count == EXPECTED_VERTICAL_RULE_COUNT
+                    and passes_curved_outer_border_topology(topology)
+                )
+            )
+        )
+        one_sided_completion = bool(
+            len(positions) <= EXPECTED_VERTICAL_RULE_COUNT - 1
+            and passes_one_sided_outer_completion(
+                matched, nearest, pitch, topology
+            )
+        )
+        if not (ordinary_topology or one_sided_completion):
+            continue
+        residual = float(np.median(nearest[matched]) / max(1.0, pitch))
+        span_ratio = float((grid[-1] - grid[0]) / image_width)
+        if not 0.55 <= span_ratio <= 0.93:
+            continue
+        # Prefer more direct observations, then a low residual.  Span is only
+        # a weak prior because close photographs legitimately change it.
+        score = (
+            float(one_sided_completion),
+            float(-match_count),
+            -topology["vertical_interval_iou"],
+            -topology["height_balance"],
+            -topology["minimum_relative_height"],
+            float(EXPECTED_VERTICAL_RULE_COUNT - match_count),
+            residual,
+            abs(span_ratio - 0.74) * 0.12,
+        )
+        candidates.append((score, grid, matched, one_sided_completion))
+    if not candidates:
+        return _select_nonuniform_vertical_lattice(
+            components, positions, image_width, tolerance
+        )
+    two_sided_candidates = [item for item in candidates if not item[3]]
+    if two_sided_candidates:
+        candidates = two_sided_candidates
+    else:
+        # A curved two-sided solution is stronger evidence than a linear
+        # one-sided extrapolation.  Try it before accepting the guarded edge
+        # completion, then fall back only when it truly cannot be formed.
+        try:
+            return _select_nonuniform_vertical_lattice(
+                components, positions, image_width, tolerance
+            )
+        except RuntimeError:
+            pass
+    _, grid, matched, one_sided_completion = min(
+        candidates, key=lambda item: item[0]
+    )
+    return (
+        [round(float(value)) for value in grid],
+        [bool(value) for value in matched.tolist()],
+        {
+            "method": (
+                "one-sided-topology-completed-lattice"
+                if one_sided_completion
+                else "topology-completed-lattice"
+            ),
+            "observed_position_count": len(positions),
+            "inferred_rule_indices": [
+                index for index, flag in enumerate(matched.tolist()) if not flag
+            ],
+        },
+    )
+
+
+def _select_nonuniform_vertical_lattice(
+    components: list[dict[str, float]],
+    positions: list[float],
+    image_width: int,
+    tolerance: float,
+) -> tuple[list[int], list[bool], dict[str, Any]]:
+    """Recover a smoothly varying 14-track lattice from partial observations.
+
+    Close photographed pages have perspective and curl, so column gaps can vary
+    monotonically across the page.  A constant-pitch model then fails even when
+    ten or more true rules remain.  Candidate observed outer borders are paired,
+    interior observations are assigned monotonically to logical indices, and a
+    quadratic x(index) model fills at most four missing tracks.  Page edges are
+    naturally rejected by their larger normalized residual/topology penalty.
+    """
+
+    observed_positions = np.asarray(positions, dtype=float)
+    candidate_models: list[
+        tuple[tuple[float, ...], np.ndarray, np.ndarray, float]
+    ] = []
+    minimum_span = image_width * 0.55
+    maximum_span = image_width * 0.93
+
+    for left_index in range(len(positions) - 1):
+        for right_index in range(left_index + 1, len(positions)):
+            left = float(positions[left_index])
+            right = float(positions[right_index])
+            span = right - left
+            segment = observed_positions[left_index : right_index + 1]
+            if not minimum_span <= span <= maximum_span or len(segment) < 10:
+                continue
+
+            linear_grid = np.linspace(
+                left, right, EXPECTED_VERTICAL_RULE_COUNT, dtype=float
+            )
+            mapping: dict[int, float] = {0: left, 13: right}
+            for value in segment[1:-1]:
+                logical_index = int(
+                    np.argmin(np.abs(linear_grid - float(value)))
+                )
+                if not 1 <= logical_index <= 12:
+                    continue
+                previous = mapping.get(logical_index)
+                if previous is None or abs(
+                    float(value) - linear_grid[logical_index]
+                ) < abs(previous - linear_grid[logical_index]):
+                    mapping[logical_index] = float(value)
+            if len(mapping) < 10:
+                continue
+
+            grid = linear_grid
+            for _ in range(3):
+                logical = np.asarray(sorted(mapping), dtype=float)
+                values = np.asarray(
+                    [mapping[int(index)] for index in logical], dtype=float
+                )
+                weights = np.ones(len(logical), dtype=float)
+                weights[(logical == 0) | (logical == 13)] = 4.0
+                coefficients = np.polyfit(logical, values, 2, w=weights)
+                grid = np.polyval(
+                    coefficients,
+                    np.arange(EXPECTED_VERTICAL_RULE_COUNT, dtype=float),
+                )
+                grid += np.linspace(
+                    left - float(grid[0]),
+                    right - float(grid[-1]),
+                    EXPECTED_VERTICAL_RULE_COUNT,
+                    dtype=float,
+                )
+                gaps = np.diff(grid)
+                median_gap = float(np.median(gaps))
+                if (
+                    median_gap <= 0
+                    or float(np.min(gaps)) < median_gap * 0.55
+                    or float(np.max(gaps)) > median_gap * 1.55
+                ):
+                    mapping = {}
+                    break
+                remapped: dict[int, float] = {0: left, 13: right}
+                for value in segment[1:-1]:
+                    logical_index = int(np.argmin(np.abs(grid - float(value))))
+                    if not 1 <= logical_index <= 12:
+                        continue
+                    previous = remapped.get(logical_index)
+                    if previous is None or abs(
+                        float(value) - grid[logical_index]
+                    ) < abs(previous - grid[logical_index]):
+                        remapped[logical_index] = float(value)
+                mapping = remapped
+                if len(mapping) < 10:
+                    break
+            if len(mapping) < 10:
+                continue
+
+            gaps = np.diff(grid)
+            pitch = float(np.median(gaps))
+            match_tolerance = max(tolerance * 1.8, pitch * 0.20)
+            nearest = np.min(
+                np.abs(grid[:, None] - observed_positions[None, :]), axis=1
+            )
+            matched = nearest <= match_tolerance
+            match_count = int(np.count_nonzero(matched))
+            if match_count < 10 or not bool(matched[0]) or not bool(matched[-1]):
+                continue
+            topology = vertical_rule_candidate_metrics(
+                components, grid, match_tolerance
+            )
+            if not (
+                passes_outer_border_topology(topology)
+                or (
+                    match_count >= 12
+                    and passes_curved_outer_border_topology(topology)
+                )
+            ):
+                continue
+            residual = float(np.median(nearest[matched]) / max(1.0, pitch))
+            outer_height_ratio = (
+                (topology["left_height"] + topology["right_height"])
+                / 2.0
+                / max(1.0, topology["internal_height_median"])
+            )
+            span_ratio = span / image_width
+            score = (
+                float(-match_count),
+                residual,
+                (1.0 - topology["vertical_interval_iou"]) * 0.30
+                + (1.0 - topology["height_balance"]) * 0.15
+                + abs(outer_height_ratio - 1.20) * 0.05,
+                abs(span_ratio - 0.79) * 0.08,
+            )
+            candidate_models.append((score, grid, matched, residual))
+
+    if not candidate_models:
+        raise RuntimeError(
+            f"{len(positions)}条竖线片段不能组成有双侧实证的14轨规则网格。"
+        )
+    _, grid, matched, residual = min(candidate_models, key=lambda item: item[0])
+    return (
+        [round(float(value)) for value in grid],
+        [bool(value) for value in matched.tolist()],
+        {
+            "method": "nonuniform-quadratic-lattice",
+            "observed_position_count": len(positions),
+            "inferred_rule_indices": [
+                index for index, flag in enumerate(matched.tolist()) if not flag
+            ],
+            "normalized_fit_residual": round(float(residual), 6),
+            "candidate_model_count": len(candidate_models),
+        },
+    )
+
+
+def detect_table_regions_with_diagnostics(
+    image: np.ndarray, page_number: int
+) -> TableRegionDetection:
+    """Find tables and retain strong rejected groups for resolution control."""
 
     height, width = image.shape[:2]
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     ink = adaptive_ink(gray)
-    vertical = cv2.morphologyEx(
+    vertical_long = cv2.morphologyEx(
         ink,
         cv2.MORPH_OPEN,
         cv2.getStructuringElement(
             cv2.MORPH_RECT, (1, max(35, round(height * 0.021)))
         ),
     )
+    vertical_local = cv2.morphologyEx(
+        ink,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(
+            cv2.MORPH_RECT, (1, max(21, round(height * 0.012)))
+        ),
+    )
+    vertical = cv2.bitwise_or(vertical_long, vertical_local)
     count, _, stats, _ = cv2.connectedComponentsWithStats(vertical, 8)
     components: list[dict[str, float]] = []
+    maximum_component_width = max(40.0, width * 0.035)
     for index in range(1, count):
         x, y, component_width, component_height, area = stats[index]
+        is_core = bool(
+            height * 0.075 <= component_height <= height * 0.72
+            and component_width <= maximum_component_width
+            and component_width / max(1.0, component_height) <= 0.105
+            and area >= component_height * 0.22
+        )
         if (
-            height * 0.18 <= component_height <= height * 0.65
-            and component_width <= max(22, width * 0.020)
-            and area >= component_height * 0.35
+            max(18.0, height * 0.009) <= component_height <= height * 0.72
+            and component_width <= maximum_component_width
+            and component_width / max(1.0, component_height) <= 0.16
+            and area >= component_height * 0.55
         ):
             components.append(
                 {
@@ -203,38 +1021,179 @@ def detect_table_regions(image: np.ndarray, page_number: int) -> list[TableRegio
                     "y": float(y),
                     "height": float(component_height),
                     "bottom": float(y + component_height - 1),
+                    "center_y": float(y + (component_height - 1) / 2),
+                    "area": float(area),
+                    "left": float(x),
+                    "right": float(x + component_width - 1),
+                    "width": float(component_width),
+                    "fragment_count": 1.0,
+                    "contains_core": is_core,
+                    "core_top": float(y) if is_core else None,
+                    "core_bottom": (
+                        float(y + component_height - 1) if is_core else None
+                    ),
+                    "core_height": float(component_height) if is_core else None,
                 }
             )
+    raw_component_count = len(components)
+    components = merge_vertical_component_fragments(components, height, width)
+    # Short local pieces are bridge evidence only.  After chaining, retain the
+    # same long-rule standard used by the original detector so digit strokes do
+    # not become lattice tracks.
+    components = [
+        item
+        for item in components
+        if (
+            height * 0.075 <= float(item["height"]) <= height * 0.72
+            and float(item.get("width", 1.0)) <= max(40.0, width * 0.045)
+            and float(item.get("width", 1.0))
+            / max(1.0, float(item["height"]))
+            <= 0.105
+            and float(item.get("area", 0.0))
+            >= float(item["height"]) * 0.22
+            and bool(item.get("contains_core", False))
+        )
+    ]
 
     groups: list[list[dict[str, float]]] = []
-    for component in sorted(components, key=lambda item: item["y"]):
+    for component in sorted(components, key=lambda item: item["center_y"]):
         if (
             not groups
             or abs(
-                component["y"]
-                - float(np.median([item["y"] for item in groups[-1]]))
+                component["center_y"]
+                - float(
+                    np.median([item["center_y"] for item in groups[-1]])
+                )
             )
-            > height * 0.035
+            > height * 0.12
         ):
             groups.append([component])
         else:
             groups[-1].append(component)
 
     regions: list[TableRegion] = []
+    rejected_groups: list[dict[str, Any]] = []
+    candidate_group_count = 0
+    strong_rejected_candidate_count = 0
     for group in groups:
+        group_positions = clustered_positions(
+            [item["x"] for item in group],
+            tolerance=vertical_rule_cluster_tolerance(width),
+        )
+        group_span = (
+            float(max(group_positions) - min(group_positions))
+            if len(group_positions) >= 2
+            else 0.0
+        )
+        median_group_height = float(
+            np.median([item["height"] for item in group])
+        )
+        strong_candidate = bool(
+            len(group_positions) >= 10
+            and group_span >= width * 0.50
+            and median_group_height >= height * 0.15
+        )
+        if len(group_positions) >= 8:
+            candidate_group_count += 1
         try:
-            rules = select_regular_vertical_rules(group, width)
-        except RuntimeError:
+            rules, observed_flags, diagnostics = (
+                select_or_complete_regular_vertical_rules(group, width)
+            )
+        except RuntimeError as error:
+            if len(group_positions) >= 8:
+                log(
+                    f"[表区诊断] 第{page_number}页候选竖线组被拒绝：{error}"
+                )
+            rejected_groups.append(
+                {
+                    "component_count": len(group),
+                    "position_count": len(group_positions),
+                    "x_span": round(group_span, 3),
+                    "median_component_height": round(median_group_height, 3),
+                    "strong_candidate": strong_candidate,
+                    "reason": str(error),
+                }
+            )
+            if strong_candidate:
+                strong_rejected_candidate_count += 1
             continue
-        selected = [
-            min(group, key=lambda item, x=x: abs(item["x"] - x))
-            for x in rules
+        pitch = float(np.median(np.diff(np.asarray(rules, dtype=float))))
+        selected: list[dict[str, float]] = []
+        median_top = float(np.median([item["y"] for item in group]))
+        median_bottom = float(np.median([item["bottom"] for item in group]))
+        for rule, observed in zip(rules, observed_flags):
+            evidence, evidence_distance = composite_vertical_rule_evidence(
+                group,
+                float(rule),
+                max(vertical_rule_cluster_tolerance(width) * 1.6, pitch * 0.14),
+                pitch,
+            )
+            if observed and evidence_distance <= max(7.0, pitch * 0.18):
+                selected.append(evidence)
+            else:
+                selected.append(
+                    {
+                        "x": float(rule),
+                        "y": median_top,
+                        "height": median_bottom - median_top + 1,
+                        "bottom": median_bottom,
+                        "center_y": (median_top + median_bottom) / 2,
+                        "area": 0.0,
+                    }
+                )
+        outer_evidence = [
+            selected[index]
+            for index in (0, EXPECTED_VERTICAL_RULE_COUNT - 1)
+            if observed_flags[index]
         ]
-        if len({round(item["x"]) for item in selected}) != EXPECTED_VERTICAL_RULE_COUNT:
+        permits_one_sided_outer = (
+            diagnostics.get("method")
+            == "one-sided-topology-completed-lattice"
+        )
+        if len(outer_evidence) < (1 if permits_one_sided_outer else 2):
             continue
-        top = max(0, round(min(item["y"] for item in selected)))
-        outer_bottom = max(selected[0]["bottom"], selected[-1]["bottom"])
+        # Outer borders begin at the table top; internal separators usually
+        # begin at the header bottom and must never define the source top.
+        top = max(
+            0,
+            round(
+                min(
+                    float(item.get("core_top", item["y"]))
+                    if item.get("core_top") is not None
+                    else float(item["y"])
+                    for item in outer_evidence
+                )
+            ),
+        )
+        outer_bottom = max(
+            float(item.get("core_bottom", item["bottom"]))
+            if item.get("core_bottom") is not None
+            else float(item["bottom"])
+            for item in outer_evidence
+        )
         bottom = min(height - 1, round(outer_bottom))
+        outer_topology = vertical_rule_candidate_metrics(
+            group,
+            rules,
+            max(vertical_rule_cluster_tolerance(width) * 1.6, pitch * 0.14),
+        )
+        diagnostics.update(
+            {
+                "component_count": len(group),
+                "raw_page_component_count": raw_component_count,
+                "merged_page_component_count": len(components),
+                "merged_fragment_count": int(
+                    sum(item.get("fragment_count", 1.0) for item in group)
+                ),
+                "source_rule_x": [int(value) for value in rules],
+                "observed_rule_flags": observed_flags,
+                "source_bbox": [rules[0], top, rules[-1], bottom],
+                "outer_border_topology": {
+                    key: round(float(value), 6)
+                    for key, value in outer_topology.items()
+                },
+            }
+        )
         regions.append(
             TableRegion(
                 page=page_number,
@@ -243,35 +1202,1557 @@ def detect_table_regions(image: np.ndarray, page_number: int) -> list[TableRegio
                 source_rules=rules,
                 source_components=selected,
                 image=np.empty((0, 0, 3), dtype=np.uint8),
+                observed_rule_flags=observed_flags,
+                diagnostics=diagnostics,
             )
         )
     regions.sort(key=lambda item: item.source_bbox[1])
     for table_index, region in enumerate(regions, start=1):
         region.table_index = table_index
-    return regions
+    return TableRegionDetection(
+        regions=regions,
+        candidate_group_count=candidate_group_count,
+        strong_rejected_candidate_count=strong_rejected_candidate_count,
+        rejected_groups=rejected_groups,
+    )
+
+
+def detect_table_regions(image: np.ndarray, page_number: int) -> list[TableRegion]:
+    """Compatibility wrapper returning only accepted daily-flow tables."""
+
+    return detect_table_regions_with_diagnostics(image, page_number).regions
+
+
+def assign_region_boundary_scan_limits(
+    regions: list[TableRegion], image_height: int
+) -> None:
+    """Give every table a non-overlapping vertical ownership interval.
+
+    A photographed page can contain two daily-flow tables only a title-height
+    apart.  Boundary discovery must therefore never use the generous padding
+    of one table to vote on the neighbouring table.  The midpoint between two
+    detected outer boxes is a neutral ownership boundary.  The top search is
+    deliberately tighter than the bottom search: a false top normally belongs
+    to the preceding table, while the photographed bottom rule can bow farther
+    below the vertical-line endpoints.
+    """
+
+    if image_height < 1:
+        raise ValueError("页面高度必须为正数。")
+    ordered = sorted(regions, key=lambda item: item.source_bbox[1])
+    for index, region in enumerate(ordered):
+        _, source_top, _, source_bottom = region.source_bbox
+        rules = np.asarray(region.source_rules, dtype=float)
+        pitch = (
+            float(np.median(np.diff(rules)))
+            if len(rules) >= 2
+            else max(12.0, (source_bottom - source_top) / 8.0)
+        )
+        top_slack = max(10, round(pitch * 0.22) + 4)
+        bottom_slack = max(25, round(pitch * 0.45) + 4)
+        ownership_top = 0
+        if index > 0:
+            previous_bottom = ordered[index - 1].source_bbox[3]
+            if previous_bottom < source_top:
+                ownership_top = round((previous_bottom + source_top) / 2.0)
+        ownership_bottom = image_height - 1
+        if index + 1 < len(ordered):
+            following_top = ordered[index + 1].source_bbox[1]
+            if source_bottom < following_top:
+                ownership_bottom = round((source_bottom + following_top) / 2.0)
+        scan_top = max(0, ownership_top, source_top - top_slack)
+        scan_bottom = min(
+            image_height - 1, ownership_bottom, source_bottom + bottom_slack
+        )
+        if scan_bottom <= scan_top:
+            raise RuntimeError(
+                f"第{region.page}页表{region.table_index}的边界扫描区间为空。"
+            )
+        region.diagnostics["boundary_scan_limits"] = [
+            int(scan_top),
+            int(scan_bottom),
+        ]
+        region.diagnostics["boundary_ownership_limits"] = [
+            int(ownership_top),
+            int(ownership_bottom),
+        ]
+        region.diagnostics["boundary_scan_slack"] = {
+            "top": int(top_slack),
+            "bottom": int(bottom_slack),
+        }
+
+
+def _clamped_curve_values(
+    sample_x: np.ndarray, sample_y: np.ndarray, query_x: np.ndarray
+) -> np.ndarray:
+    """Evaluate a shape-preserving curve without unsafe edge extrapolation."""
+
+    if len(sample_x) >= 3 and np.all(np.diff(sample_x) > 0):
+        values = np.asarray(
+            PchipInterpolator(sample_x, sample_y, extrapolate=True)(query_x),
+            dtype=float,
+        )
+    else:
+        values = np.interp(query_x, sample_x, sample_y).astype(float)
+    values[query_x <= sample_x[0]] = sample_y[0]
+    values[query_x >= sample_x[-1]] = sample_y[-1]
+    return values
+
+
+def _regularize_horizontal_samples(
+    sample_x: np.ndarray,
+    raw_y: np.ndarray,
+    search_radius: int,
+    pitch: float,
+) -> np.ndarray:
+    """Remove isolated glyph snaps while retaining a smoothly bowed rule."""
+
+    values = raw_y.astype(float).copy()
+    if len(values) < 4:
+        return values
+    keep = np.ones(len(values), dtype=bool)
+    coefficients = np.polyfit(sample_x, values, 2)
+    for _ in range(4):
+        prediction = np.polyval(coefficients, sample_x)
+        residual = values - prediction
+        centered = residual[keep] - float(np.median(residual[keep]))
+        mad = float(np.median(np.abs(centered))) if centered.size else 0.0
+        threshold = max(3.5, search_radius * 0.26, mad * 3.2)
+        revised = np.abs(residual) <= threshold
+        if int(np.count_nonzero(revised)) < 5 or np.array_equal(revised, keep):
+            break
+        keep = revised
+        coefficients = np.polyfit(sample_x[keep], values[keep], 2)
+    prediction = np.polyval(coefficients, sample_x)
+    replacement_threshold = max(4.0, search_radius * 0.30)
+    values[np.abs(values - prediction) > replacement_threshold] = prediction[
+        np.abs(values - prediction) > replacement_threshold
+    ]
+
+    # A photographed page can fold, so this is a local slope limiter rather
+    # than a global straight/quadratic replacement.
+    maximum_step = max(4.0, pitch * 0.085)
+    for _ in range(3):
+        forward = values.copy()
+        backward = values.copy()
+        for index in range(1, len(values)):
+            forward[index] = float(
+                np.clip(
+                    forward[index],
+                    forward[index - 1] - maximum_step,
+                    forward[index - 1] + maximum_step,
+                )
+            )
+        for index in range(len(values) - 2, -1, -1):
+            backward[index] = float(
+                np.clip(
+                    backward[index],
+                    backward[index + 1] - maximum_step,
+                    backward[index + 1] + maximum_step,
+                )
+            )
+        values = (forward + backward) / 2.0
+    return values
+
+
+def _track_horizontal_rule_samples(
+    gray: np.ndarray,
+    horizontal_evidence: np.ndarray,
+    rules: np.ndarray,
+    nominal_y: float,
+    search_radius: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Track one curved horizontal rule independently through all 13 cells."""
+
+    height, width = gray.shape
+    centers_x = (rules[:-1] + rules[1:]) / 2.0
+    raw: list[float] = []
+    for column in range(EXPECTED_COLUMN_COUNT):
+        cell_width = max(8.0, rules[column + 1] - rules[column])
+        x0 = max(0, round(rules[column] + cell_width * 0.12))
+        x1 = min(width, round(rules[column + 1] - cell_width * 0.12) + 1)
+        y0 = max(1, round(nominal_y) - search_radius)
+        y1 = min(height - 1, round(nominal_y) + search_radius + 1)
+        if x1 <= x0 or y1 <= y0:
+            raw.append(float(nominal_y))
+            continue
+        scores: list[float] = []
+        for y in range(y0, y1):
+            line_window = horizontal_evidence[y - 1 : y + 2, x0:x1]
+            gray_window = gray[y - 1 : y + 2, x0:x1]
+            support = float(np.count_nonzero(line_window)) / max(1, line_window.size)
+            darkness = float(np.mean(255 - gray_window.astype(np.float32))) / 255.0
+            distance = abs(y - nominal_y) / max(1.0, search_radius)
+            scores.append(support * 3.2 + darkness * 0.32 - distance * 0.08)
+        raw.append(float(y0 + int(np.argmax(np.asarray(scores, dtype=float)))))
+    raw_values = np.asarray(raw, dtype=float)
+    pitch = float(np.median(np.diff(rules)))
+    return raw_values, _regularize_horizontal_samples(
+        centers_x, raw_values, search_radius, pitch
+    )
+
+
+def _detect_source_horizontal_boundaries_legacy(
+    gray: np.ndarray, ink: np.ndarray, region: TableRegion
+) -> tuple[np.ndarray, dict[str, np.ndarray], np.ndarray, dict[str, Any]]:
+    """Legacy global-y seed finder retained as a guarded fallback."""
+
+    image_height, image_width = gray.shape
+    rules = np.asarray(region.source_rules, dtype=float)
+    pitch = float(np.median(np.diff(rules)))
+    _, source_top, _, source_bottom = region.source_bbox
+    source_span = max(1, source_bottom - source_top)
+    upper_padding = max(
+        18, round(source_span * 0.16), round(pitch * 3.6)
+    )
+    lower_padding = max(
+        18, round(source_span * 0.16), round(pitch * 3.0)
+    )
+    y0 = max(0, source_top - upper_padding)
+    y1 = min(image_height, source_bottom + lower_padding + 1)
+    scan_limits = region.diagnostics.get("boundary_scan_limits")
+    if isinstance(scan_limits, (list, tuple)) and len(scan_limits) == 2:
+        y0 = max(y0, int(scan_limits[0]))
+        y1 = min(y1, int(scan_limits[1]) + 1)
+
+    horizontal = cv2.morphologyEx(
+        ink,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(
+            cv2.MORPH_RECT, (max(13, round(pitch * 0.28)), 1)
+        ),
+    )
+    horizontal = cv2.dilate(
+        horizontal,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (1, 5)),
+    )
+    coverage = np.zeros(image_height, dtype=np.int16)
+    for column in range(EXPECTED_COLUMN_COUNT):
+        cell_width = max(8.0, rules[column + 1] - rules[column])
+        x0 = max(0, round(rules[column] + cell_width * 0.05))
+        x1 = min(image_width, round(rules[column + 1] - cell_width * 0.05) + 1)
+        if x1 <= x0:
+            continue
+        row_counts = np.count_nonzero(horizontal[y0:y1, x0:x1], axis=1)
+        minimum_pixels = max(5, round((x1 - x0) * 0.18))
+        coverage[y0:y1] += (row_counts >= minimum_pixels).astype(np.int16)
+
+    active_rows = np.flatnonzero(
+        (coverage >= 5)
+        & (np.arange(image_height) >= y0)
+        & (np.arange(image_height) < y1)
+    )
+    groups: list[list[int]] = []
+    maximum_gap = max(2, round(source_span * 0.003))
+    for row in active_rows.tolist():
+        if not groups or row - groups[-1][-1] > maximum_gap:
+            groups.append([row])
+        else:
+            groups[-1].append(row)
+    bands: list[float] = []
+    band_scores: list[int] = []
+    for group in groups:
+        rows = np.asarray(group, dtype=int)
+        weights = coverage[rows].astype(float)
+        bands.append(float(np.average(rows, weights=np.maximum(weights, 1.0))))
+        band_scores.append(int(np.max(coverage[rows])))
+    if len(bands) < 4:
+        raise RuntimeError(
+            f"横向局部线段只形成{len(bands)}个结构带，不能确定表头和统计区。"
+        )
+
+    band_values = np.asarray(bands, dtype=float)
+    band_gaps = np.diff(band_values)
+    minimum_daily_gap = max(source_span * 0.28, pitch * 3.8)
+    eligible_gaps = np.flatnonzero(band_gaps >= minimum_daily_gap)
+    if eligible_gaps.size == 0:
+        raise RuntimeError("没有检测到足够长的31日数据区横向空带。")
+    split_index = int(
+        eligible_gaps[
+            np.argmax(band_gaps[eligible_gaps])
+        ]
+    )
+    header_nominal = float(band_values[split_index])
+    statistics_nominal = float(band_values[split_index + 1])
+    top_ranked: list[tuple[float, int]] = []
+    for index in range(split_index):
+        ratio = (header_nominal - band_values[index]) / max(1.0, pitch)
+        if 0.18 <= ratio <= 1.15:
+            score = (
+                abs(ratio - 0.50)
+                - 0.35 * band_scores[index] / EXPECTED_COLUMN_COUNT
+            )
+            top_ranked.append((float(score), index))
+    if not top_ranked:
+        raise RuntimeError("表头之前没有符合表头高度拓扑的真实顶框。")
+    top_score, top_index = min(top_ranked, key=lambda item: item[0])
+    top_nominal = float(band_values[top_index])
+
+    bottom_ranked: list[tuple[float, int]] = []
+    for index in range(split_index + 2, len(band_values)):
+        ratio = (band_values[index] - statistics_nominal) / max(1.0, pitch)
+        if 1.20 <= ratio <= 3.15:
+            score = (
+                abs(ratio - 2.45) * 0.32
+                - 1.15 * band_scores[index] / EXPECTED_COLUMN_COUNT
+                + 0.08
+                * abs(band_values[index] - source_bottom)
+                / max(1.0, source_span)
+            )
+            bottom_ranked.append((float(score), index))
+    if not bottom_ranked:
+        raise RuntimeError("统计区之后没有符合统计区高度拓扑的真实底框。")
+    bottom_score, bottom_index = min(bottom_ranked, key=lambda item: item[0])
+    bottom_nominal = float(band_values[bottom_index])
+    if not (
+        top_nominal + max(8.0, source_span * 0.018) < header_nominal
+        and header_nominal + source_span * 0.25 < statistics_nominal
+        and statistics_nominal + max(6.0, source_span * 0.025) < bottom_nominal
+    ):
+        raise RuntimeError(
+            "四条结构曲线次序不成立，拒绝以固定比例替代真实表格边界。"
+        )
+
+    detected_span = max(1.0, bottom_nominal - top_nominal)
+    search_radius = max(8, round(max(pitch * 0.18, detected_span * 0.018)))
+    curves: dict[str, np.ndarray] = {}
+    raw_curves: dict[str, np.ndarray] = {}
+    for name, nominal in (
+        ("table_top", top_nominal),
+        ("header_bottom", header_nominal),
+        ("statistics_top", statistics_nominal),
+        ("table_bottom", bottom_nominal),
+    ):
+        raw, regularized = _track_horizontal_rule_samples(
+            gray, horizontal, rules, nominal, search_radius
+        )
+        raw_curves[name] = raw
+        curves[name] = regularized
+
+    centers_x = (rules[:-1] + rules[1:]) / 2.0
+    diagnostics: dict[str, Any] = {
+        "horizontal_band_centers": [round(value, 3) for value in bands],
+        "horizontal_band_support_columns": band_scores,
+        "daily_band_gap": round(float(band_gaps[split_index]), 3),
+        "minimum_daily_band_gap": round(float(minimum_daily_gap), 3),
+        "boundary_band_indices": {
+            "table_top": top_index,
+            "header_bottom": split_index,
+            "statistics_top": split_index + 1,
+            "table_bottom": bottom_index,
+        },
+        "boundary_band_scores": {
+            "table_top": round(top_score, 6),
+            "table_bottom": round(bottom_score, 6),
+        },
+        "boundary_scan_y": [y0, y1 - 1],
+        "horizontal_support_threshold": 5,
+        "boundary_search_radius": search_radius,
+        "source_column_center_x": [round(float(value), 3) for value in centers_x],
+        "source_boundary_raw_y": {
+            name: [round(float(value), 3) for value in values]
+            for name, values in raw_curves.items()
+        },
+        "source_boundary_regularized_y": {
+            name: [round(float(value), 3) for value in values]
+            for name, values in curves.items()
+        },
+    }
+    return centers_x, curves, horizontal, diagnostics
+
+
+def _curve_local_maxima(
+    values: np.ndarray, radius: int, threshold: float
+) -> list[int]:
+    maxima: list[int] = []
+    for index in range(radius, len(values) - radius):
+        window = values[index - radius : index + radius + 1]
+        if values[index] < threshold or values[index] != np.max(window):
+            continue
+        if (
+            maxima
+            and index - maxima[-1] <= radius
+            and values[index] <= values[maxima[-1]]
+        ):
+            continue
+        maxima.append(index)
+    return maxima
+
+
+def _horizontal_curve_response(
+    gray: np.ndarray,
+    ink: np.ndarray,
+    rules: np.ndarray,
+    y0: int,
+    y1: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Score short locally sloped rule fragments in every month cell."""
+
+    pitch = float(np.median(np.diff(rules)))
+    horizontal = cv2.morphologyEx(
+        ink,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(
+            cv2.MORPH_RECT, (max(11, round(pitch * 0.18)), 1)
+        ),
+    )
+    height = max(0, y1 - y0)
+    scores = np.zeros((EXPECTED_COLUMN_COUNT, height), dtype=np.float32)
+    support = np.zeros_like(scores)
+    line_span = np.zeros_like(scores)
+    for column in range(EXPECTED_COLUMN_COUNT):
+        cell_width = max(8.0, rules[column + 1] - rules[column])
+        x0 = max(0, round(rules[column] + cell_width * 0.10))
+        x1 = min(gray.shape[1], round(rules[column + 1] - cell_width * 0.10) + 1)
+        if x1 <= x0 or height < 5:
+            continue
+        strip = horizontal[y0:y1, x0:x1]
+        darkness = (
+            255 - gray[y0:y1, x0:x1].astype(np.float32)
+        ) / 255.0
+        xs = np.arange(x1 - x0, dtype=np.int32)
+        centered_x = xs - (len(xs) - 1) / 2.0
+        for local_y in range(2, height - 2):
+            best_support = 0.0
+            best_darkness = 0.0
+            best_span = 0.0
+            best_objective = -1.0
+            # A boundary may move four pixels across one photographed cell.
+            for delta in range(-4, 5):
+                ys = np.rint(
+                    local_y
+                    + delta * centered_x / max(1.0, len(xs) - 1.0)
+                ).astype(np.int32)
+                valid = (ys >= 0) & (ys < height)
+                values = strip[ys[valid], xs[valid]] > 0
+                dark_values = darkness[ys[valid], xs[valid]]
+                current_support = (
+                    float(np.mean(values)) if values.size else 0.0
+                )
+                current_darkness = (
+                    float(np.mean(dark_values)) if dark_values.size else 0.0
+                )
+                indices = np.flatnonzero(values)
+                current_span = (
+                    float(indices[-1] - indices[0] + 1) / values.size
+                    if indices.size >= 2
+                    else 0.0
+                )
+                objective = current_support + 0.20 * current_span
+                if objective > best_objective:
+                    best_objective = objective
+                    best_support = current_support
+                    best_darkness = current_darkness
+                    best_span = current_span
+            support[column, local_y] = best_support
+            line_span[column, local_y] = best_span
+            scores[column, local_y] = (
+                3.8 * best_support
+                + 0.75 * best_span
+                + 0.30 * best_darkness
+            )
+        scores[column] = cv2.dilate(
+            scores[column][None, :], np.ones((1, 3), np.uint8)
+        )[0]
+    return scores, support, line_span, horizontal
+
+
+def _horizontal_curve_candidates(
+    scores: np.ndarray,
+    support: np.ndarray,
+    line_span: np.ndarray,
+    y0: int,
+) -> list[list[dict[str, float]]]:
+    candidates: list[list[dict[str, float]]] = []
+    for column in range(scores.shape[0]):
+        threshold = max(0.78, float(np.quantile(scores[column], 0.82)))
+        peaks = _curve_local_maxima(scores[column], 2, threshold)
+        candidates.append(
+            [
+                {
+                    "y": float(y0 + index),
+                    "score": float(scores[column, index]),
+                    "support": float(support[column, index]),
+                    "span": float(line_span[column, index]),
+                }
+                for index in peaks
+                if (
+                    support[column, index] >= 0.08
+                    or line_span[column, index] >= 0.45
+                )
+            ]
+        )
+    return candidates
+
+
+def _horizontal_trajectory_from_seed(
+    candidates: list[list[dict[str, float]]],
+    seed_column: int,
+    seed_index: int,
+    pitch: float,
+) -> dict[str, Any]:
+    """Trace one smooth boundary in both directions through optional gaps."""
+
+    maximum_step = max(5.0, pitch * 0.105)
+    y_values: list[float | None] = [None] * len(candidates)
+    chosen: list[dict[str, float] | None] = [None] * len(candidates)
+    seed = candidates[seed_column][seed_index]
+    y_values[seed_column] = seed["y"]
+    chosen[seed_column] = seed
+
+    def extend(
+        indices: list[int], previous_y: float, previous_slope: float
+    ) -> None:
+        misses = 0
+        for column in indices:
+            predicted = previous_y + previous_slope
+            available = [
+                item
+                for item in candidates[column]
+                if abs(item["y"] - predicted)
+                <= maximum_step * (1.0 + 0.45 * misses)
+            ]
+            if not available:
+                misses += 1
+                if misses > 2:
+                    break
+                previous_y = predicted
+                continue
+            item = max(
+                available,
+                key=lambda value: (
+                    value["score"]
+                    - 0.16 * abs(value["y"] - predicted)
+                    - 0.08
+                    * abs((value["y"] - previous_y) - previous_slope)
+                ),
+            )
+            slope = item["y"] - previous_y
+            y_values[column] = item["y"]
+            chosen[column] = item
+            previous_slope = 0.60 * previous_slope + 0.40 * slope
+            previous_y = item["y"]
+            misses = 0
+
+    extend(
+        list(range(seed_column + 1, len(candidates))),
+        float(seed["y"]),
+        0.0,
+    )
+    extend(
+        list(range(seed_column - 1, -1, -1)),
+        float(seed["y"]),
+        0.0,
+    )
+    observed = [index for index, item in enumerate(chosen) if item is not None]
+    if not observed:
+        return {}
+    observed_x = np.asarray(observed, dtype=float)
+    observed_y = np.asarray(
+        [float(y_values[index]) for index in observed], dtype=float
+    )
+    full_y = np.interp(
+        np.arange(len(candidates), dtype=float), observed_x, observed_y
+    )
+    first_differences = np.diff(full_y)
+    second_differences = np.diff(first_differences)
+    support_columns = sum(
+        1
+        for item in chosen
+        if item is not None and item["support"] >= 0.12
+    )
+    span_columns = sum(
+        1
+        for item in chosen
+        if item is not None and item["span"] >= 0.55
+    )
+    mean_score = float(
+        np.mean([item["score"] for item in chosen if item is not None])
+    )
+    objective = (
+        len(observed)
+        + 0.55 * support_columns
+        + 0.40 * span_columns
+        + 0.70 * mean_score
+        - 0.08 * float(np.sum(np.abs(first_differences)))
+        - 0.10 * float(np.sum(np.abs(second_differences)))
+        - 0.42 * (len(candidates) - len(observed))
+    )
+    return {
+        "y": full_y,
+        "observed_columns": len(observed),
+        "support_columns": support_columns,
+        "span_columns": span_columns,
+        "mean_score": mean_score,
+        "objective": objective,
+        "median_y": float(np.median(full_y)),
+        "range_y": float(np.max(full_y) - np.min(full_y)),
+    }
+
+
+def _enumerate_horizontal_trajectories(
+    candidates: list[list[dict[str, float]]], pitch: float
+) -> list[dict[str, Any]]:
+    paths: list[dict[str, Any]] = []
+    for column, items in enumerate(candidates):
+        for index in range(len(items)):
+            path = _horizontal_trajectory_from_seed(
+                candidates, column, index, pitch
+            )
+            if not path or int(path["observed_columns"]) < 7:
+                continue
+            if (
+                int(path["support_columns"]) < 5
+                and int(path["span_columns"]) < 7
+            ):
+                continue
+            duplicate_index = next(
+                (
+                    existing_index
+                    for existing_index, existing in enumerate(paths)
+                    if float(
+                        np.median(np.abs(existing["y"] - path["y"]))
+                    )
+                    < 4.0
+                ),
+                None,
+            )
+            if duplicate_index is None:
+                paths.append(path)
+            elif float(path["objective"]) > float(
+                paths[duplicate_index]["objective"]
+            ):
+                paths[duplicate_index] = path
+    return sorted(paths, key=lambda item: float(item["median_y"]))
+
+
+def _outer_vertical_contact_support(
+    ink: np.ndarray,
+    rules: np.ndarray,
+    boundary_y: np.ndarray,
+    pitch: float,
+    *,
+    direction: str,
+) -> tuple[float, float]:
+    """Measure whether a horizontal boundary actually meets both outer rules.
+
+    A horizontal stroke alone occupies only a few rows.  A true table corner
+    also has locally vertical ink extending into the table.  Row-wise support
+    inside a narrow tube remains valid when the photographed border is curved.
+    """
+
+    vertical = cv2.morphologyEx(
+        ink,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(
+            cv2.MORPH_RECT, (1, max(7, round(pitch * 0.14)))
+        ),
+    )
+    height, width = ink.shape
+    supports: list[float] = []
+    for x_value, y_value in (
+        (float(rules[0]), float(boundary_y[0])),
+        (float(rules[-1]), float(boundary_y[-1])),
+    ):
+        # The nominal rule is a whole-track centroid; a curled outer border can
+        # be farther away at the table corner.  The tube remains well below
+        # half a column, so a neighbouring month separator cannot satisfy it.
+        radius_x = max(5, round(pitch * 0.23))
+        if direction == "below":
+            ya = round(y_value - pitch * 0.08)
+            yb = round(y_value + pitch * 0.62)
+        elif direction == "above":
+            ya = round(y_value - pitch * 0.62)
+            yb = round(y_value + pitch * 0.08)
+        else:
+            raise ValueError(f"未知交点方向：{direction}")
+        xa = max(0, round(x_value) - radius_x)
+        xb = min(width, round(x_value) + radius_x + 1)
+        ya = max(0, ya)
+        yb = min(height, yb + 1)
+        if xa >= xb or ya >= yb:
+            supports.append(0.0)
+            continue
+        row_support = np.any(vertical[ya:yb, xa:xb] != 0, axis=1)
+        supports.append(float(np.count_nonzero(row_support) / len(row_support)))
+    return float(supports[0]), float(supports[1])
+
+
+def _top_boundary_inner_rule_consensus(
+    ink: np.ndarray,
+    region: TableRegion,
+    rules: np.ndarray,
+    curves: dict[str, np.ndarray],
+    pitch: float,
+) -> tuple[bool, dict[str, Any]]:
+    """Validate a table top after raw outer components were polluted/clipped.
+
+    Internal month separators begin at the header-bottom rule.  Their median
+    start is therefore an independent reference that a photographed page edge
+    cannot shift.  It is used only together with two real outer intersections.
+    """
+
+    internal_tops: list[float] = []
+    for index, component in enumerate(region.source_components[1:-1], start=1):
+        observed = (
+            not region.observed_rule_flags
+            or index >= len(region.observed_rule_flags)
+            or bool(region.observed_rule_flags[index])
+        )
+        if observed and "y" in component:
+            core_top = component.get("core_top")
+            internal_tops.append(
+                float(component["y"] if core_top is None else core_top)
+            )
+    header_median = float(np.median(curves["header_bottom"]))
+    top_median = float(np.median(curves["table_top"]))
+    contact_left, contact_right = _outer_vertical_contact_support(
+        ink,
+        rules,
+        curves["table_top"],
+        pitch,
+        direction="below",
+    )
+    internal_top = (
+        float(np.median(internal_tops)) if internal_tops else float("nan")
+    )
+    header_error = (
+        abs(header_median - internal_top) if internal_tops else float("inf")
+    )
+    top_error = (
+        abs(top_median - internal_top) if internal_tops else float("inf")
+    )
+    top_to_internal = (
+        internal_top - top_median if internal_tops else float("nan")
+    )
+    reference_name = (
+        "header-bottom" if header_error <= top_error else "table-top"
+    )
+    reference_error = min(header_error, top_error)
+    reference_topology_valid = bool(
+        (reference_name == "header-bottom" and pitch * 0.18 <= top_to_internal <= pitch * 1.20)
+        or (reference_name == "table-top" and top_error <= max(8.0, pitch * 0.32))
+    )
+    accepted = bool(
+        len(internal_tops) >= 7
+        and reference_error <= max(8.0, pitch * 0.32)
+        and reference_topology_valid
+        and min(contact_left, contact_right) >= 0.20
+    )
+    diagnostics = {
+        "accepted": accepted,
+        "internal_rule_count": len(internal_tops),
+        "internal_start_median": (
+            None if not internal_tops else round(internal_top, 3)
+        ),
+        "header_median": round(header_median, 3),
+        "header_to_internal_error": (
+            None if not internal_tops else round(header_error, 3)
+        ),
+        "top_to_internal_error": (
+            None if not internal_tops else round(top_error, 3)
+        ),
+        "internal_start_reference": reference_name,
+        "internal_start_reference_error": (
+            None if not internal_tops else round(reference_error, 3)
+        ),
+        "top_to_internal_distance": (
+            None if not internal_tops else round(top_to_internal, 3)
+        ),
+        "outer_contact_support": [
+            round(contact_left, 4),
+            round(contact_right, 4),
+        ],
+    }
+    return accepted, diagnostics
+
+
+def _choose_structural_boundary_trajectories(
+    paths: list[dict[str, Any]],
+    source_top: int,
+    source_bottom: int,
+    pitch: float,
+    outer_bottom_targets: tuple[float | None, float | None] | None = None,
+) -> tuple[dict[str, dict[str, Any]], dict[str, float]]:
+    """Jointly choose four curves from the largest 31-day structural gap."""
+
+    if len(paths) < 4:
+        raise RuntimeError(f"跨列横线轨迹只有{len(paths)}条。")
+    minimum_daily_gap = max(
+        (source_bottom - source_top) * 0.28, pitch * 3.8
+    )
+    adjacent_gaps = [
+        float(np.median(paths[index + 1]["y"] - paths[index]["y"]))
+        for index in range(len(paths) - 1)
+    ]
+    eligible = [
+        index
+        for index, gap in enumerate(adjacent_gaps)
+        if (
+            gap >= minimum_daily_gap
+            and int(paths[index]["observed_columns"]) >= 9
+            and int(paths[index + 1]["observed_columns"]) >= 9
+        )
+    ]
+    if not eligible:
+        raise RuntimeError("没有形成由完整曲线围成的31日数据长空带。")
+    header_index = max(eligible, key=lambda index: adjacent_gaps[index])
+    statistics_index = header_index + 1
+    header = paths[header_index]
+    statistics = paths[statistics_index]
+
+    top_ranked: list[tuple[float, int]] = []
+    for index in range(header_index):
+        ratio = float(np.median(header["y"] - paths[index]["y"])) / pitch
+        compact_header = bool(
+            max(0.08, 8.0 / max(1.0, pitch)) <= ratio < 0.18
+            and abs(float(np.median(paths[index]["y"])) - source_top)
+            <= pitch * 0.28
+            and int(paths[index]["observed_columns"]) >= 7
+            and int(paths[index]["support_columns"]) >= 7
+            and int(paths[index]["span_columns"]) >= 5
+        )
+        if 0.18 <= ratio <= 1.15 or compact_header:
+            score = (
+                abs(ratio - 0.50)
+                - 0.012 * float(paths[index]["objective"])
+                + (0.18 if compact_header else 0.0)
+            )
+            top_ranked.append((score, index))
+    if not top_ranked:
+        raise RuntimeError("表头底曲线之前没有符合高度拓扑的顶框曲线。")
+    top_index = min(top_ranked)[1]
+
+    bottom_ranked: list[
+        tuple[float, int, float, float, float, float]
+    ] = []
+    source_span = max(1, source_bottom - source_top)
+    outer_tolerance = max(10.0, pitch * 0.35)
+    for index in range(statistics_index + 1, len(paths)):
+        ratio = float(
+            np.median(paths[index]["y"] - statistics["y"])
+        ) / pitch
+        if 1.20 <= ratio <= 3.15:
+            left_error = 0.0
+            right_error = 0.0
+            if outer_bottom_targets is not None:
+                if outer_bottom_targets[0] is not None:
+                    left_error = abs(
+                        float(paths[index]["y"][0]) - outer_bottom_targets[0]
+                    )
+                if outer_bottom_targets[1] is not None:
+                    right_error = abs(
+                        float(paths[index]["y"][-1]) - outer_bottom_targets[1]
+                    )
+            contact_left, contact_right = paths[index].get(
+                "bottom_outer_contact_support", (0.0, 0.0)
+            )
+            # Raw endpoints can both belong to the photographed page edge, so
+            # disagreement carries no penalty.  They contribute only a small
+            # bonus when *both* sides independently agree with this curve.
+            endpoint_pairs = [
+                (error, target)
+                for error, target in zip(
+                    (left_error, right_error),
+                    outer_bottom_targets or (None, None),
+                )
+                if target is not None
+            ]
+            endpoint_penalty = (
+                -1.00
+                if len(endpoint_pairs) == 2
+                and all(error <= outer_tolerance for error, _ in endpoint_pairs)
+                else 0.0
+            )
+            contact_penalty = 0.22 * (
+                max(0.0, 0.32 - float(contact_left))
+                + max(0.0, 0.32 - float(contact_right))
+            ) / 0.32
+            score = (
+                abs(ratio - 2.45) * 0.32
+                - 0.15 * float(paths[index]["objective"])
+                + 0.08
+                * abs(float(np.median(paths[index]["y"])) - source_bottom)
+                / source_span
+                + endpoint_penalty
+                + contact_penalty
+            )
+            bottom_ranked.append(
+                (
+                    score,
+                    index,
+                    left_error,
+                    right_error,
+                    float(contact_left),
+                    float(contact_right),
+                )
+            )
+    if not bottom_ranked:
+        raise RuntimeError("统计区之后没有符合高度拓扑的表底曲线。")
+    (
+        _,
+        bottom_index,
+        bottom_left_error,
+        bottom_right_error,
+        bottom_contact_left,
+        bottom_contact_right,
+    ) = min(bottom_ranked)
+    selected = {
+        "table_top": paths[top_index],
+        "header_bottom": header,
+        "statistics_top": statistics,
+        "table_bottom": paths[bottom_index],
+    }
+    selected_top_ratio = float(
+        np.median(header["y"] - selected["table_top"]["y"])
+    ) / max(1.0, pitch)
+    if selected_top_ratio < 0.18:
+        # Very compact headers often expose the top rule in only part of the
+        # width; trajectory interpolation can then touch the header at an
+        # unsupported column.  Preserve both detected curves while enforcing
+        # their known non-crossing form topology at those missing samples.
+        compact_top = dict(selected["table_top"])
+        compact_top["y"] = np.minimum(
+            np.asarray(compact_top["y"], dtype=float),
+            np.asarray(header["y"], dtype=float) - max(9.0, pitch * 0.105),
+        )
+        selected["table_top"] = compact_top
+    if not (
+        np.all(selected["table_top"]["y"] + 8 < header["y"])
+        and np.all(header["y"] + pitch * 3.2 < statistics["y"])
+        and np.all(statistics["y"] + 6 < selected["table_bottom"]["y"])
+    ):
+        raise RuntimeError("联合选择的四条边界曲线交叉或次序不成立。")
+    gaps = {
+        "header_height": float(
+            np.median(header["y"] - selected["table_top"]["y"])
+        ),
+        "daily_height": float(np.median(statistics["y"] - header["y"])),
+        "statistics_height": float(
+            np.median(selected["table_bottom"]["y"] - statistics["y"])
+        ),
+        "minimum_daily_gap": float(minimum_daily_gap),
+        "bottom_left_outer_error": float(bottom_left_error),
+        "bottom_right_outer_error": float(bottom_right_error),
+        "bottom_outer_tolerance": float(outer_tolerance),
+        "bottom_outer_contact_left": float(bottom_contact_left),
+        "bottom_outer_contact_right": float(bottom_contact_right),
+        "bottom_verified_outer_side_count": float(
+            sum(
+                target is not None
+                for target in (outer_bottom_targets or (None, None))
+            )
+        ),
+    }
+    return selected, gaps
+
+
+def _detect_source_horizontal_boundaries_curved(
+    gray: np.ndarray, ink: np.ndarray, region: TableRegion
+) -> tuple[np.ndarray, dict[str, np.ndarray], np.ndarray, dict[str, Any]]:
+    """Jointly discover four boundaries from all cross-column trajectories."""
+
+    image_height, _ = gray.shape
+    rules = np.asarray(region.source_rules, dtype=float)
+    if len(rules) != EXPECTED_VERTICAL_RULE_COUNT:
+        raise RuntimeError("边界曲线需要14条竖轨。")
+    centers_x = (rules[:-1] + rules[1:]) / 2.0
+    pitch = float(np.median(np.diff(rules)))
+    _, source_top, _, source_bottom = region.source_bbox
+    source_span = max(1.0, float(source_bottom - source_top))
+    if "boundary_scan_limits" not in region.diagnostics:
+        assign_region_boundary_scan_limits([region], image_height)
+    scan_limits = region.diagnostics["boundary_scan_limits"]
+    y0 = max(0, int(scan_limits[0]))
+    y1 = min(image_height - 1, int(scan_limits[1]))
+    if y1 - y0 < max(80.0, source_span * 0.55):
+        raise RuntimeError("本表边界扫描区间过窄。")
+
+    outer_bottom_targets: tuple[float | None, float | None] | None = None
+    if (
+        len(region.source_components) == EXPECTED_VERTICAL_RULE_COUNT
+        and len(region.observed_rule_flags) == EXPECTED_VERTICAL_RULE_COUNT
+        and region.observed_rule_flags[0]
+        and region.observed_rule_flags[-1]
+    ):
+        internal_heights = [
+            float(
+                item["height"]
+                if item.get("core_height") is None
+                else item["core_height"]
+            )
+            for item in region.source_components[1:-1]
+            if "height" in item
+        ]
+        median_internal_height = (
+            float(np.median(internal_heights))
+            if len(internal_heights) >= 4
+            else None
+        )
+
+        def reliable_bottom_target(component: dict[str, float]) -> float | None:
+            if "bottom" not in component:
+                return None
+            component_height = component.get("core_height")
+            component_bottom = component.get("core_bottom")
+            if component_height is None:
+                component_height = component.get("height")
+            if component_bottom is None:
+                component_bottom = component.get("bottom")
+            if median_internal_height is None or component_height is None:
+                return float(component_bottom)
+            relative_height = float(component_height) / max(
+                1.0, median_internal_height
+            )
+            if 0.92 <= relative_height <= 1.75:
+                return float(component_bottom)
+            return None
+
+        outer_bottom_targets = (
+            reliable_bottom_target(region.source_components[0]),
+            reliable_bottom_target(region.source_components[-1]),
+        )
+
+    ownership_limits = region.diagnostics.get(
+        "boundary_ownership_limits", [0, image_height - 1]
+    )
+    ownership_bottom = min(image_height - 1, int(ownership_limits[1]))
+    expanded_bottom = min(
+        ownership_bottom,
+        max(
+            y1,
+            round(source_bottom + pitch * 2.20),
+            round(source_top + source_span * 1.28),
+        ),
+    )
+    scan_attempts = [(y0, y1, "source-bbox")]
+    if expanded_bottom >= y1 + max(18, round(pitch * 0.45)):
+        scan_attempts.append((y0, expanded_bottom, "adaptive-downward"))
+
+    selected: dict[str, dict[str, Any]] | None = None
+    gap_diagnostics: dict[str, float] = {}
+    horizontal = np.zeros_like(ink)
+    candidates: list[list[dict[str, float]]] = []
+    paths: list[dict[str, Any]] = []
+    scan_errors: list[str] = []
+    selected_scan_method = "source-bbox"
+    for attempt_y0, attempt_y1, attempt_method in scan_attempts:
+        scores, support, line_span, attempt_horizontal = (
+            _horizontal_curve_response(
+                gray, ink, rules, attempt_y0, attempt_y1 + 1
+            )
+        )
+        attempt_candidates = _horizontal_curve_candidates(
+            scores, support, line_span, attempt_y0
+        )
+        attempt_paths = _enumerate_horizontal_trajectories(
+            attempt_candidates, pitch
+        )
+        for path in attempt_paths:
+            path["bottom_outer_contact_support"] = (
+                _outer_vertical_contact_support(
+                    ink,
+                    rules,
+                    np.asarray(path["y"], dtype=float),
+                    pitch,
+                    direction="above",
+                )
+            )
+        try:
+            attempt_selected, attempt_gaps = (
+                _choose_structural_boundary_trajectories(
+                    attempt_paths,
+                    source_top,
+                    source_bottom,
+                    pitch,
+                    outer_bottom_targets,
+                )
+            )
+        except RuntimeError as error:
+            scan_errors.append(f"{attempt_method}={error}")
+            continue
+        selected = attempt_selected
+        gap_diagnostics = attempt_gaps
+        horizontal = attempt_horizontal
+        candidates = attempt_candidates
+        paths = attempt_paths
+        y0, y1 = attempt_y0, attempt_y1
+        selected_scan_method = attempt_method
+        break
+    if selected is None:
+        raise RuntimeError("；".join(scan_errors) or "没有找到四条结构边界曲线。")
+    has_outer_track_evidence = bool(
+        len(region.source_components) == EXPECTED_VERTICAL_RULE_COUNT
+        and all(
+            "height" in region.source_components[index]
+            for index in (0, EXPECTED_VERTICAL_RULE_COUNT - 1)
+        )
+    )
+    if has_outer_track_evidence:
+        bottom_contacts = (
+            gap_diagnostics.get("bottom_outer_contact_left", 0.0),
+            gap_diagnostics.get("bottom_outer_contact_right", 0.0),
+        )
+        bottom_path = selected["table_bottom"]
+        internal_consensus = bool(
+            int(bottom_path.get("observed_columns", 0)) >= 11
+            and int(bottom_path.get("support_columns", 0)) >= 10
+            and int(bottom_path.get("span_columns", 0)) >= 10
+        )
+        one_sided_closure = bool(
+            max(bottom_contacts) >= 0.30 and internal_consensus
+        )
+        if min(bottom_contacts) < 0.20 and not one_sided_closure:
+            raise RuntimeError(
+                "表底曲线既未闭合双侧外竖轨，也没有单侧闭合加内部曲线共识。"
+            )
+    raw_curves = {
+        name: np.asarray(path["y"], dtype=float)
+        for name, path in selected.items()
+    }
+    curves = {
+        name: _regularize_horizontal_samples(
+            centers_x,
+            values,
+            max(8, round(pitch * 0.25)),
+            pitch,
+        )
+        for name, values in raw_curves.items()
+    }
+
+    source_top_tolerance = max(5.0, pitch * 0.22)
+    top_median = float(np.median(curves["table_top"]))
+    raw_top_aligned = not (
+        float(np.min(curves["table_top"]))
+        < source_top - source_top_tolerance
+        or top_median > source_top + pitch * 0.65
+    )
+    inner_consensus, top_consensus_diagnostics = (
+        _top_boundary_inner_rule_consensus(
+            ink,
+            region,
+            rules,
+            curves,
+            pitch,
+        )
+    )
+    if not raw_top_aligned and not inner_consensus:
+        raise RuntimeError("顶框偏离source_bbox外竖框起点，拒绝伪边界。")
+    if not (
+        np.all(curves["header_bottom"] > curves["table_top"] + 6.0)
+        and np.all(
+            curves["statistics_top"]
+            > curves["header_bottom"] + pitch * 3.2
+        )
+        and np.all(curves["table_bottom"] > curves["statistics_top"] + 6.0)
+    ):
+        raise RuntimeError("四条边界曲线逐列次序或间距不成立。")
+
+    trajectory_diagnostics = [
+        {
+            "median_y": round(float(path["median_y"]), 3),
+            "observed_columns": int(path["observed_columns"]),
+            "support_columns": int(path["support_columns"]),
+            "span_columns": int(path["span_columns"]),
+            "objective": round(float(path["objective"]), 4),
+            "range_y": round(float(path["range_y"]), 3),
+        }
+        for path in paths
+    ]
+    selected_diagnostics = {
+        name: {
+            "observed_columns": int(path["observed_columns"]),
+            "support_columns": int(path["support_columns"]),
+            "span_columns": int(path["span_columns"]),
+            "objective": round(float(path["objective"]), 4),
+            "range_y": round(float(path["range_y"]), 3),
+        }
+        for name, path in selected.items()
+    }
+    diagnostics: dict[str, Any] = {
+        "boundary_seed_method": "column-local-trajectory-gap",
+        "boundary_scan_method": selected_scan_method,
+        "boundary_scan_limits": [y0, y1],
+        "boundary_scan_y": [y0, y1],
+        "source_column_center_x": [
+            round(float(value), 3) for value in centers_x
+        ],
+        "minimum_daily_band_gap": round(
+            float(gap_diagnostics["minimum_daily_gap"]), 3
+        ),
+        "local_candidate_count_by_column": [
+            len(items) for items in candidates
+        ],
+        "horizontal_trajectory_count": len(paths),
+        "horizontal_trajectories": trajectory_diagnostics,
+        "boundary_curve_evidence": selected_diagnostics,
+        "top_boundary_reference": {
+            "raw_source_bbox_aligned": raw_top_aligned,
+            "selection_method": (
+                "raw-outer-start"
+                if raw_top_aligned
+                else "inner-rule-start-and-outer-intersections"
+            ),
+            **top_consensus_diagnostics,
+        },
+        "boundary_gap_diagnostics": {
+            key: round(float(value), 3)
+            for key, value in gap_diagnostics.items()
+        },
+        "source_boundary_raw_y": {
+            name: [round(float(value), 3) for value in values]
+            for name, values in raw_curves.items()
+        },
+        "source_boundary_regularized_y": {
+            name: [round(float(value), 3) for value in values]
+            for name, values in curves.items()
+        },
+    }
+    return centers_x, curves, horizontal, diagnostics
+
+
+def _detect_source_horizontal_boundaries(
+    gray: np.ndarray, ink: np.ndarray, region: TableRegion
+) -> tuple[np.ndarray, dict[str, np.ndarray], np.ndarray, dict[str, Any]]:
+    """Find four true source curves with a strictly guarded legacy fallback."""
+
+    try:
+        return _detect_source_horizontal_boundaries_curved(gray, ink, region)
+    except RuntimeError as curved_error:
+        try:
+            centers_x, curves, horizontal, diagnostics = (
+                _detect_source_horizontal_boundaries_legacy(gray, ink, region)
+            )
+        except RuntimeError as legacy_error:
+            raise RuntimeError(
+                f"逐列曲线边界失败：{curved_error}；"
+                f"全局边界回退也失败：{legacy_error}"
+            ) from curved_error
+        rules = np.asarray(region.source_rules, dtype=float)
+        pitch = float(np.median(np.diff(rules)))
+        top_curve = curves["table_top"]
+        header_curve = curves["header_bottom"]
+        statistics_curve = curves["statistics_top"]
+        bottom_curve = curves["table_bottom"]
+        _, source_top, _, _ = region.source_bbox
+        if (
+            float(np.min(top_curve)) < source_top - max(5.0, pitch * 0.22)
+            or float(np.median(top_curve)) > source_top + pitch * 0.65
+            or not np.all(header_curve > top_curve + pitch * 0.10)
+            or not np.all(statistics_curve > header_curve + pitch * 3.0)
+            or not np.all(bottom_curve > statistics_curve + pitch * 0.24)
+        ):
+            raise RuntimeError(
+                f"逐列曲线边界失败：{curved_error}；"
+                "全局回退顶框偏离source_bbox或四曲线拓扑不成立。"
+            ) from curved_error
+        diagnostics["boundary_seed_method"] = "guarded-global-y-fallback"
+        diagnostics["curved_seed_error"] = str(curved_error)
+        diagnostics["boundary_scan_limits"] = region.diagnostics.get(
+            "boundary_scan_limits", diagnostics.get("boundary_scan_y", [])
+        )
+        return centers_x, curves, horizontal, diagnostics
+
+
+def _robust_vertical_polynomial(
+    y_values: np.ndarray,
+    x_values: np.ndarray,
+    weights: np.ndarray,
+    residual_floor: float,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    keep = np.ones(len(y_values), dtype=bool)
+    coefficients = np.polyfit(y_values, x_values, 2, w=weights)
+    for _ in range(5):
+        residual = x_values - np.polyval(coefficients, y_values)
+        centered = residual[keep] - float(np.median(residual[keep]))
+        mad = float(np.median(np.abs(centered))) if centered.size else 0.0
+        threshold = max(residual_floor, mad * 3.2)
+        revised = np.abs(residual) <= threshold
+        if int(np.count_nonzero(revised)) < 6 or np.array_equal(revised, keep):
+            break
+        keep = revised
+        coefficients = np.polyfit(
+            y_values[keep], x_values[keep], 2, w=weights[keep]
+        )
+    retained_residual = x_values[keep] - np.polyval(coefficients, y_values[keep])
+    rmse = float(np.sqrt(np.mean(retained_residual**2))) if retained_residual.size else 0.0
+    return coefficients.astype(float), keep, rmse
+
+
+def _fit_source_vertical_rule_models(
+    gray: np.ndarray,
+    ink: np.ndarray,
+    region: TableRegion,
+    source_top: float,
+    source_bottom: float,
+) -> tuple[list[np.ndarray], list[dict[str, Any]]]:
+    """Trace fourteen ordered x(y) curves from short local vertical pieces."""
+
+    image_height, image_width = gray.shape
+    rules = np.asarray(region.source_rules, dtype=float)
+    pitch = float(np.median(np.diff(rules)))
+    table_height = max(1.0, source_bottom - source_top)
+    vertical = cv2.morphologyEx(
+        ink,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(
+            cv2.MORPH_RECT, (1, max(9, round(table_height * 0.014)))
+        ),
+    )
+    sample_y = np.linspace(source_top, source_bottom, 72)
+    search_radius = max(8, round(pitch * 0.27))
+    half_band = max(3, round(table_height * 0.0055))
+    models: list[np.ndarray | None] = []
+    diagnostics: list[dict[str, Any]] = []
+    for rule_index, nominal_x in enumerate(rules):
+        observed_y: list[float] = []
+        observed_x: list[float] = []
+        observed_weight: list[float] = []
+        for y_value in sample_y:
+            y = round(float(y_value))
+            ya = max(0, y - half_band)
+            yb = min(image_height, y + half_band + 1)
+            xa = max(0, round(nominal_x) - search_radius)
+            xb = min(image_width, round(nominal_x) + search_radius + 1)
+            if ya >= yb or xa >= xb:
+                continue
+            line_support = np.count_nonzero(vertical[ya:yb, xa:xb], axis=0).astype(float)
+            line_support /= max(1, yb - ya)
+            darkness = np.mean(
+                255 - gray[ya:yb, xa:xb].astype(np.float32), axis=0
+            ) / 255.0
+            candidate_x = np.arange(xa, xb, dtype=float)
+            distance = np.abs(candidate_x - nominal_x) / max(1.0, search_radius)
+            score = line_support * 2.6 + darkness * 0.30 - distance * 0.16
+            selected = int(np.argmax(score))
+            if line_support[selected] < 0.22:
+                continue
+            observed_y.append(float(y_value))
+            observed_x.append(float(xa + selected))
+            observed_weight.append(float(0.5 + line_support[selected]))
+        model: np.ndarray | None = None
+        retained_count = 0
+        rmse: float | None = None
+        if len(observed_y) >= 8:
+            model, keep, fitted_rmse = _robust_vertical_polynomial(
+                np.asarray(observed_y, dtype=float),
+                np.asarray(observed_x, dtype=float),
+                np.asarray(observed_weight, dtype=float),
+                max(2.0, pitch * 0.055),
+            )
+            retained_count = int(np.count_nonzero(keep))
+            rmse = fitted_rmse
+            probe = np.polyval(model, sample_y)
+            if (
+                retained_count < 6
+                or float(np.max(np.abs(probe - nominal_x))) > search_radius * 1.35
+            ):
+                model = None
+        models.append(model)
+        diagnostics.append(
+            {
+                "rule_index": rule_index,
+                "nominal_x": round(float(nominal_x), 3),
+                "candidate_observation_count": len(observed_y),
+                "retained_observation_count": retained_count,
+                "rmse": None if rmse is None else round(float(rmse), 3),
+                "inferred": model is None,
+            }
+        )
+
+    good_indices = [index for index, model in enumerate(models) if model is not None]
+    if len(good_indices) < 8:
+        raise RuntimeError(
+            f"14条竖向曲轨中只有{len(good_indices)}条有可靠局部线段证据。"
+        )
+    correction_models = []
+    for index in good_indices:
+        base = np.asarray([0.0, 0.0, rules[index]], dtype=float)
+        correction_models.append(np.asarray(models[index], dtype=float) - base)
+    shared_correction = np.median(np.stack(correction_models), axis=0)
+    for index, model in enumerate(models):
+        if model is None:
+            models[index] = shared_correction + np.asarray(
+                [0.0, 0.0, rules[index]], dtype=float
+            )
+
+    final_models = [np.asarray(model, dtype=float) for model in models]
+    # Reject/correct a track that would cross its neighbours.  Its replacement
+    # inherits only the common page bend, never a nearby digit stroke.
+    probe_y = np.linspace(source_top, source_bottom, 32)
+    for index in range(EXPECTED_VERTICAL_RULE_COUNT):
+        values = np.polyval(final_models[index], probe_y)
+        invalid = False
+        if index > 0:
+            previous = np.polyval(final_models[index - 1], probe_y)
+            invalid = invalid or bool(np.any(values - previous < pitch * 0.42))
+        if index + 1 < EXPECTED_VERTICAL_RULE_COUNT:
+            following = np.polyval(final_models[index + 1], probe_y)
+            invalid = invalid or bool(np.any(following - values < pitch * 0.42))
+        if invalid:
+            final_models[index] = shared_correction + np.asarray(
+                [0.0, 0.0, rules[index]], dtype=float
+            )
+            diagnostics[index]["inferred"] = True
+            diagnostics[index]["rejection_reason"] = "non-crossing topology"
+    for index, model in enumerate(final_models):
+        diagnostics[index]["coefficients"] = [
+            round(float(value), 10) for value in model
+        ]
+    return final_models, diagnostics
+
+
+def _ordered_rule_positions(
+    values: np.ndarray, pitch: float, image_width: int
+) -> np.ndarray:
+    ordered = np.clip(values.astype(float), 0.0, image_width - 1.0)
+    minimum_gap = max(4.0, pitch * 0.42)
+    for _ in range(2):
+        for index in range(1, len(ordered)):
+            ordered[index] = max(ordered[index], ordered[index - 1] + minimum_gap)
+        for index in range(len(ordered) - 2, -1, -1):
+            ordered[index] = min(ordered[index], ordered[index + 1] - minimum_gap)
+        ordered = np.clip(ordered, 0.0, image_width - 1.0)
+    return ordered
 
 
 def rectify_table_region(image: np.ndarray, region: TableRegion) -> np.ndarray:
-    """Flatten the bowed upper border and column rules of a photographed table."""
+    """Flatten a photographed surface with a local, non-rigid curve mesh."""
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    ink = adaptive_ink(gray)
+    rules = np.asarray(region.source_rules, dtype=float)
+    pitch = float(np.median(np.diff(rules)))
+    centers_x, sampled_curves, _, boundary_diagnostics = (
+        _detect_source_horizontal_boundaries(gray, ink, region)
+    )
+    median_boundaries = {
+        name: float(np.median(values)) for name, values in sampled_curves.items()
+    }
+    vertical_models, vertical_diagnostics = _fit_source_vertical_rule_models(
+        gray,
+        ink,
+        region,
+        median_boundaries["table_top"],
+        median_boundaries["table_bottom"],
+    )
+
+    source_boundary_rules: dict[str, np.ndarray] = {}
+    for name, values in sampled_curves.items():
+        intersection_y = _clamped_curve_values(centers_x, values, rules)
+        # Two fixed-point refinements approximate each intersection between the
+        # horizontal curve and its corresponding x(y) rule track.
+        for _ in range(2):
+            intersection_x = np.asarray(
+                [
+                    np.polyval(vertical_models[index], intersection_y[index])
+                    for index in range(EXPECTED_VERTICAL_RULE_COUNT)
+                ],
+                dtype=float,
+            )
+            intersection_y = _clamped_curve_values(
+                centers_x, values, intersection_x
+            )
+        source_boundary_rules[name] = intersection_y
+
+    minimum_header_height = max(8.0, pitch * 0.10)
+    minimum_statistics_height = max(6.0, pitch * 0.08)
+    top_rules = source_boundary_rules["table_top"]
+    header_rules = np.maximum(
+        source_boundary_rules["header_bottom"], top_rules + minimum_header_height
+    )
+    statistics_rules = np.maximum(
+        source_boundary_rules["statistics_top"],
+        header_rules + max(80.0, (median_boundaries["statistics_top"] - median_boundaries["header_bottom"]) * 0.72),
+    )
+    bottom_rules = np.maximum(
+        source_boundary_rules["table_bottom"],
+        statistics_rules + minimum_statistics_height,
+    )
+    source_boundary_rules = {
+        "table_top": top_rules,
+        "header_bottom": header_rules,
+        "statistics_top": statistics_rules,
+        "table_bottom": bottom_rules,
+    }
 
     left, _, right, _ = region.source_bbox
-    components = region.source_components
-    xs = np.asarray([item["x"] for item in components], dtype=np.float32)
-    tops = np.asarray([item["y"] for item in components], dtype=np.float32)
-    top_coefficients = np.polyfit(xs, tops, 2)
-    output_width = right - left + 1
-    output_x = np.arange(output_width, dtype=np.float32)
-    source_x = output_x + left
-    top_curve = np.polyval(top_coefficients, source_x).astype(np.float32)
-    bottom_curve = np.interp(
-        source_x,
-        [components[0]["x"], components[-1]["x"]],
-        [components[0]["bottom"], components[-1]["bottom"]],
-    ).astype(np.float32)
-    output_height = max(300, round(float(np.median(bottom_curve - top_curve))))
-    fractions = np.linspace(0.0, 1.0, output_height, dtype=np.float32)[:, None]
-    map_x = np.broadcast_to(source_x[None, :], (output_height, output_width)).copy()
-    map_y = top_curve[None, :] + fractions * (bottom_curve - top_curve)[None, :]
+    output_width = max(200, right - left + 1)
+    output_rules = np.asarray(
+        [round(float(value - left)) for value in rules], dtype=int
+    )
+    output_rules[0] = 0
+    output_rules[-1] = output_width - 1
+    header_height = max(12, round(float(np.median(header_rules - top_rules))))
+    daily_height = max(180, round(float(np.median(statistics_rules - header_rules))))
+    statistics_height = max(
+        12, round(float(np.median(bottom_rules - statistics_rules)))
+    )
+    output_boundaries = {
+        "table_top": 0,
+        "header_bottom": header_height,
+        "statistics_top": header_height + daily_height,
+        "table_bottom": header_height + daily_height + statistics_height,
+    }
+    output_height = output_boundaries["table_bottom"] + 1
+    output_x = np.arange(output_width, dtype=float)
+    map_x = np.empty((output_height, output_width), dtype=np.float32)
+    map_y = np.empty((output_height, output_width), dtype=np.float32)
+    bands = (
+        ("table_top", "header_bottom"),
+        ("header_bottom", "statistics_top"),
+        ("statistics_top", "table_bottom"),
+    )
+    for upper_name, lower_name in bands:
+        output_upper = output_boundaries[upper_name]
+        output_lower = output_boundaries[lower_name]
+        denominator = max(1, output_lower - output_upper)
+        for output_y in range(output_upper, output_lower + 1):
+            fraction = (output_y - output_upper) / denominator
+            source_y_rules = (
+                source_boundary_rules[upper_name] * (1.0 - fraction)
+                + source_boundary_rules[lower_name] * fraction
+            )
+            source_x_rules = np.asarray(
+                [
+                    np.polyval(vertical_models[index], source_y_rules[index])
+                    for index in range(EXPECTED_VERTICAL_RULE_COUNT)
+                ],
+                dtype=float,
+            )
+            source_x_rules = _ordered_rule_positions(
+                source_x_rules, pitch, image.shape[1]
+            )
+            map_x[output_y] = np.interp(
+                output_x, output_rules, source_x_rules
+            ).astype(np.float32)
+            map_y[output_y] = np.interp(
+                output_x, output_rules, source_y_rules
+            ).astype(np.float32)
+
+    # A visually plausible control mesh can still fold between control lines.
+    # Check the dense mapping orientation before any OCR/cell extraction uses it.
+    sampling_step = max(1, min(output_height, output_width) // 420)
+    qa_map_x = map_x[::sampling_step, ::sampling_step].astype(np.float64)
+    qa_map_y = map_y[::sampling_step, ::sampling_step].astype(np.float64)
+    map_x_dy, map_x_dx = np.gradient(qa_map_x)
+    map_y_dy, map_y_dx = np.gradient(qa_map_y)
+    jacobian = map_x_dx * map_y_dy - map_x_dy * map_y_dx
+    finite_jacobian = jacobian[np.isfinite(jacobian)]
+    if finite_jacobian.size == 0:
+        raise RuntimeError("非刚性映射没有有限的雅可比值。")
+    median_jacobian = float(np.median(finite_jacobian))
+    minimum_jacobian = float(np.min(finite_jacobian))
+    first_percentile_jacobian = float(np.percentile(finite_jacobian, 1))
+    if (
+        median_jacobian <= 0
+        or minimum_jacobian <= 0
+        or first_percentile_jacobian < median_jacobian * 0.05
+    ):
+        raise RuntimeError(
+            "非刚性曲线网格发生局部翻折，拒绝把错误映射传给OCR。"
+        )
+
     rectified = cv2.remap(
         image,
         map_x,
@@ -279,16 +2760,46 @@ def rectify_table_region(image: np.ndarray, region: TableRegion) -> np.ndarray:
         cv2.INTER_CUBIC,
         borderMode=cv2.BORDER_REPLICATE,
     )
-    gray = cv2.cvtColor(rectified, cv2.COLOR_BGR2GRAY)
-    background = cv2.GaussianBlur(gray, (0, 0), 31)
-    normalized = cv2.divide(gray, np.maximum(background, 1), scale=245)
+    rectified_gray = cv2.cvtColor(rectified, cv2.COLOR_BGR2GRAY)
+    background = cv2.GaussianBlur(rectified_gray, (0, 0), 31)
+    normalized = cv2.divide(
+        rectified_gray, np.maximum(background, 1), scale=245
+    )
+
+    region.source_bbox = (
+        left,
+        round(median_boundaries["table_top"]),
+        right,
+        round(median_boundaries["table_bottom"]),
+    )
+    region.rectified_rules = output_rules.astype(int).tolist()
+    region.rectified_boundaries = output_boundaries
+    region.diagnostics.update(boundary_diagnostics)
+    region.diagnostics.update(
+        {
+            "source_boundary_y_at_rules": {
+                name: [round(float(value), 3) for value in values]
+                for name, values in source_boundary_rules.items()
+            },
+            "source_vertical_rule_tracks": vertical_diagnostics,
+            "rectified_rules": region.rectified_rules,
+            "rectified_boundaries": region.rectified_boundaries,
+            "rectification_model": "piecewise-curve-mesh",
+            "mapping_jacobian": {
+                "sampling_step": sampling_step,
+                "minimum": round(minimum_jacobian, 6),
+                "first_percentile": round(first_percentile_jacobian, 6),
+                "median": round(median_jacobian, 6),
+            },
+        }
+    )
     return cv2.cvtColor(normalized, cv2.COLOR_GRAY2BGR)
 
 
 def select_regular_vertical_rules(
     components: list[dict[str, float]], image_width: int
 ) -> list[int]:
-    tolerance = max(4.0, image_width * 0.0035)
+    tolerance = vertical_rule_cluster_tolerance(image_width)
     x_positions = clustered_positions(
         [item["x"] for item in components], tolerance=tolerance
     )
@@ -312,16 +2823,40 @@ def select_regular_vertical_rules(
         span = rules[-1] - rules[0]
         if span < image_width * 0.55:
             continue
-        cv = float(np.std(gaps) / max(mean_gap, 1.0))
         edge_penalty = abs(span / image_width - 0.79) * 0.12
-        candidates.append((cv + edge_penalty, rules))
+        topology = vertical_rule_candidate_metrics(
+            components,
+            rules,
+            max(tolerance * 1.6, mean_gap * 0.14),
+        )
+        if not (
+            passes_outer_border_topology(topology)
+            or passes_curved_outer_border_topology(topology)
+        ):
+            continue
+        topology_penalty = (
+            (1.0 - topology["vertical_interval_iou"]) * 0.10
+            + (1.0 - topology["height_balance"]) * 0.06
+            + max(0.0, 1.15 - topology["minimum_relative_height"])
+            * 0.04
+        )
+        candidates.append(
+            (
+                topology["month_gap_trend_residual"]
+                + topology["month_gap_cv"] * 0.20
+                + topology_penalty
+                + edge_penalty,
+                rules,
+            )
+        )
     if not candidates:
         raise RuntimeError("没有找到由14条近似等距竖线组成的日流量表。")
     candidates.sort(key=lambda item: item[0])
     chosen = candidates[0][1]
     gaps = np.diff(np.asarray(chosen, dtype=float))
-    if float(np.max(gaps) / max(np.min(gaps), 1.0)) > 1.35:
-        raise RuntimeError("日流量表竖线间距不稳定，不能安全切分13列。")
+    month_gaps = gaps[1:]
+    if float(np.max(month_gaps) / max(np.min(month_gaps), 1.0)) > 1.35:
+        raise RuntimeError("日流量表月列间距不稳定，不能安全切分12个月。")
     return [round(value) for value in chosen]
 
 
@@ -730,17 +3265,9 @@ def build_multicolumn_support_candidates(
             centers = np.asarray(
                 [candidate.center for candidate in selected], dtype=float
             )
-            # The printed layout inserts a wider gap after days 5, 10, ... 25.
-            # Fitting that known rhythm scores evidence; it never fabricates a row.
-            pattern = np.asarray(
-                [index + 0.82 * (index // 5) for index in range(31)],
-                dtype=float,
-            )
-            slope, intercept = np.polyfit(pattern, centers, 1)
-            residual = float(
-                np.sqrt(np.mean((centers - (slope * pattern + intercept)) ** 2))
-                / max(abs(slope), 1.0)
-            )
+            # Score the best supported form rhythm.  This keeps the threshold
+            # search neutral between five-day, ten-day and uniform editions.
+            residual = best_anchor_rhythm_residual(centers)
             option_candidates.append(
                 (
                     (
@@ -761,61 +3288,152 @@ def build_multicolumn_support_candidates(
 
 
 def choose_31_anchors(
-    candidates: list[AnchorCandidate], body_top: int, body_bottom: int
+    candidates: list[AnchorCandidate],
+    body_top: int,
+    body_bottom: int,
+    minimum_support_columns: int = 5,
 ) -> list[AnchorCandidate]:
     if len(candidates) < EXPECTED_DAY_COUNT:
         raise RuntimeError(
             f"墨迹投影只形成{len(candidates)}个候选行，少于31行；"
             "拒绝按固定行距凭空补行。"
         )
-    if len(candidates) == EXPECTED_DAY_COUNT:
-        chosen = candidates
-    else:
-        centers = np.asarray([item.center for item in candidates], dtype=float)
-        gaps = np.diff(centers)
-        lower_gaps = gaps[gaps <= np.percentile(gaps, 70)]
-        base_pitch = float(np.median(lower_gaps)) if lower_gaps.size else 1.0
-        base_pitch = max(base_pitch, (body_bottom - body_top) / 55)
-        negative = -1.0e12
-        n = len(candidates)
-        dp = np.full((EXPECTED_DAY_COUNT, n), negative, dtype=float)
-        parent = np.full((EXPECTED_DAY_COUNT, n), -1, dtype=int)
-        for index, candidate in enumerate(candidates):
-            start_penalty = abs(candidate.center - body_top) / base_pitch * 0.12
-            dp[0, index] = candidate.score - start_penalty
-        group_breaks = {5, 10, 15, 20, 25}
-        for selected_index in range(1, EXPECTED_DAY_COUNT):
-            previous_day = selected_index
-            expected_gap = base_pitch * (
-                1.82 if previous_day in group_breaks else 1.0
+    candidates = sorted(candidates, key=lambda item: item.center)
+    centers = np.asarray([item.center for item in candidates], dtype=float)
+    positive_gaps = np.diff(centers)
+    positive_gaps = positive_gaps[positive_gaps > 0]
+    if not positive_gaps.size:
+        raise RuntimeError("候选锚点没有有效的纵向间隔。")
+    # Split glyph bands create abnormally small gaps.  The middle/upper part of
+    # the gap distribution is a much safer pitch seed than the lower tail.
+    lower = float(np.percentile(positive_gaps, 38))
+    upper = float(np.percentile(positive_gaps, 82))
+    ordinary = positive_gaps[
+        (positive_gaps >= lower) & (positive_gaps <= upper)
+    ]
+    robust_pitch = float(np.median(ordinary)) if ordinary.size else float(
+        np.median(positive_gaps)
+    )
+    robust_pitch = max(robust_pitch, (body_bottom - body_top) / 58.0)
+
+    negative = -1.0e12
+    path_options: list[
+        tuple[tuple[float, float, float, float], list[AnchorCandidate]]
+    ] = []
+    n = len(candidates)
+    for _, group_breaks, break_factor in ANCHOR_RHYTHM_MODELS:
+        rhythm = anchor_rhythm_coordinates(group_breaks, break_factor)
+        rhythm_units = max(1.0, float(rhythm[-1] - rhythm[0]))
+        span_pitch = float((centers[-1] - centers[0]) / rhythm_units)
+        pitch_seeds = {
+            max(1.0, robust_pitch * factor)
+            for factor in (0.82, 0.92, 1.0, 1.08, 1.18)
+        }
+        pitch_seeds.update(
+            max(1.0, span_pitch * factor) for factor in (0.88, 1.0, 1.12)
+        )
+        for base_pitch in sorted(pitch_seeds):
+            dp = np.full((EXPECTED_DAY_COUNT, n), negative, dtype=float)
+            parent = np.full((EXPECTED_DAY_COUNT, n), -1, dtype=int)
+            for index, candidate in enumerate(candidates):
+                start_penalty = (
+                    abs(candidate.center - body_top) / base_pitch * 0.10
+                )
+                dp[0, index] = candidate.score - start_penalty
+            for selected_index in range(1, EXPECTED_DAY_COUNT):
+                expected_gap = base_pitch * (
+                    break_factor
+                    if selected_index in group_breaks
+                    else 1.0
+                )
+                minimum_gap = expected_gap * 0.58
+                maximum_gap = expected_gap * 1.70
+                for current in range(selected_index, n):
+                    for previous in range(selected_index - 1, current):
+                        if dp[selected_index - 1, previous] <= negative / 2:
+                            continue
+                        gap = (
+                            candidates[current].center
+                            - candidates[previous].center
+                        )
+                        if not minimum_gap <= gap <= maximum_gap:
+                            continue
+                        normalized_error = abs(gap - expected_gap) / max(
+                            1.0, expected_gap
+                        )
+                        gap_penalty = (
+                            normalized_error * 3.2
+                            + normalized_error * normalized_error * 2.0
+                        )
+                        value = (
+                            dp[selected_index - 1, previous]
+                            + candidates[current].score
+                            - gap_penalty
+                        )
+                        if value > dp[selected_index, current]:
+                            dp[selected_index, current] = value
+                            parent[selected_index, current] = previous
+            end_scores = dp[-1].copy()
+            for index, candidate in enumerate(candidates):
+                end_scores[index] -= (
+                    abs(body_bottom - candidate.center) / base_pitch * 0.10
+                )
+            end = int(np.argmax(end_scores))
+            if end_scores[end] <= negative / 2:
+                continue
+            indices = [end]
+            for selected_index in range(EXPECTED_DAY_COUNT - 1, 0, -1):
+                end = int(parent[selected_index, end])
+                if end < 0:
+                    indices = []
+                    break
+                indices.append(end)
+            if not indices:
+                continue
+            chosen_option = [
+                candidates[index] for index in reversed(indices)
+            ]
+            chosen_centers = np.asarray(
+                [item.center for item in chosen_option], dtype=float
             )
-            for current in range(selected_index, n):
-                for previous in range(selected_index - 1, current):
-                    gap = candidates[current].center - candidates[previous].center
-                    gap_penalty = abs(gap - expected_gap) / base_pitch * 2.2
-                    value = (
-                        dp[selected_index - 1, previous]
-                        + candidates[current].score
-                        - gap_penalty
-                    )
-                    if value > dp[selected_index, current]:
-                        dp[selected_index, current] = value
-                        parent[selected_index, current] = previous
-        end_scores = dp[-1].copy()
-        for index, candidate in enumerate(candidates):
-            end_scores[index] -= (
-                abs(body_bottom - candidate.center) / base_pitch * 0.12
+            slope, intercept = np.polyfit(rhythm, chosen_centers, 1)
+            fitted = slope * rhythm + intercept
+            rhythm_residual = float(
+                np.sqrt(np.mean(np.square(chosen_centers - fitted)))
+                / max(abs(float(slope)), 1.0)
             )
-        end = int(np.argmax(end_scores))
-        if end_scores[end] <= negative / 2:
-            raise RuntimeError("31行锚点动态规划没有形成有效路径。")
-        indices = [end]
-        for selected_index in range(EXPECTED_DAY_COUNT - 1, 0, -1):
-            end = int(parent[selected_index, end])
-            if end < 0:
-                raise RuntimeError("31行锚点动态规划回溯失败。")
-            indices.append(end)
-        chosen = [candidates[index] for index in reversed(indices)]
+            weak_count = float(
+                sum(
+                    item.support_columns < minimum_support_columns
+                    or not item.day_column_support
+                    for item in chosen_option
+                )
+            )
+            endpoint_penalty = float(
+                (
+                    abs(chosen_centers[0] - body_top)
+                    + abs(body_bottom - chosen_centers[-1])
+                )
+                / max(1.0, abs(float(slope)))
+            )
+            mean_support = float(
+                np.mean([item.score for item in chosen_option])
+            )
+            path_options.append(
+                (
+                    (
+                        weak_count,
+                        rhythm_residual,
+                        endpoint_penalty * 0.025,
+                        -mean_support,
+                    ),
+                    chosen_option,
+                )
+            )
+
+    if not path_options:
+        raise RuntimeError("31行锚点动态规划没有形成有效路径。")
+    _, chosen = min(path_options, key=lambda item: item[0])
 
     if len(chosen) != EXPECTED_DAY_COUNT:
         raise RuntimeError("最终行锚点数量不是31。")
@@ -827,7 +3445,12 @@ def choose_31_anchors(
     weak = [
         index + 1
         for index, item in enumerate(chosen)
-        if item.support_columns < 5 or not item.day_column_support
+        if item.support_columns < minimum_support_columns
+        or (
+            not item.day_column_support
+            and item.support_columns
+            < max(8, minimum_support_columns + 3)
+        )
     ]
     if weak:
         raise RuntimeError(
@@ -835,6 +3458,42 @@ def choose_31_anchors(
             + "、".join(map(str, weak))
         )
     return chosen
+
+
+def anchor_rhythm_coordinates(
+    group_breaks: frozenset[int] | set[int], break_factor: float
+) -> np.ndarray:
+    """Return normalized row centers for one printed grouping convention."""
+
+    values = [0.0]
+    for previous_day in range(1, EXPECTED_DAY_COUNT):
+        values.append(
+            values[-1]
+            + (break_factor if previous_day in group_breaks else 1.0)
+        )
+    return np.asarray(values, dtype=float)
+
+
+def best_anchor_rhythm_residual(centers: np.ndarray) -> float:
+    """Measure a 31-row path against the best supported form rhythm."""
+
+    if len(centers) != EXPECTED_DAY_COUNT:
+        return float("inf")
+    residuals: list[float] = []
+    for _, group_breaks, break_factor in ANCHOR_RHYTHM_MODELS:
+        pattern = anchor_rhythm_coordinates(group_breaks, break_factor)
+        slope, intercept = np.polyfit(pattern, centers, 1)
+        residuals.append(
+            float(
+                np.sqrt(
+                    np.mean(
+                        np.square(centers - (slope * pattern + intercept))
+                    )
+                )
+                / max(abs(float(slope)), 1.0)
+            )
+        )
+    return min(residuals)
 
 
 def detect_page_geometry(
@@ -897,6 +3556,31 @@ def darkest_rule_row(gray: np.ndarray, top: int, bottom: int) -> int:
     return top + int(np.argmax(darkness))
 
 
+def validate_anchor_rhythm(
+    anchors: list[AnchorCandidate], body_top: int, body_bottom: int
+) -> None:
+    """Reject a 31-row path that has visibly snapped two days to one glyph."""
+
+    if len(anchors) != EXPECTED_DAY_COUNT:
+        raise RuntimeError("锚点节律校验收到的行数不是31。")
+    centers = np.asarray([item.center for item in anchors], dtype=float)
+    gaps = np.diff(centers)
+    ordinary = gaps[gaps <= np.percentile(gaps, 70)]
+    base_pitch = float(np.median(ordinary)) if ordinary.size else 1.0
+    if base_pitch <= 0:
+        raise RuntimeError("31行锚点没有有效行距。")
+    if float(np.min(gaps)) < base_pitch * 0.40:
+        raise RuntimeError(
+            "相邻日序锚点过近，疑似两个虚拟/实锚点吸附到同一处墨迹。"
+        )
+    if float(np.max(gaps)) > base_pitch * 2.35:
+        raise RuntimeError("相邻日序锚点间出现异常大断层。")
+    if centers[0] - body_top < base_pitch * 0.32:
+        raise RuntimeError("第1日锚点贴住表头分界线。")
+    if body_bottom - centers[-1] < base_pitch * 0.32:
+        raise RuntimeError("第31日锚点贴住统计区分界线。")
+
+
 def detect_rectified_geometry(
     image: np.ndarray, region: TableRegion
 ) -> PageGeometry:
@@ -904,29 +3588,47 @@ def detect_rectified_geometry(
 
     height, width = image.shape[:2]
     left_source = region.source_bbox[0]
-    vertical_rules = [
-        min(width - 1, max(0, round(x - left_source)))
-        for x in region.source_rules
-    ]
+    if len(region.rectified_rules) == EXPECTED_VERTICAL_RULE_COUNT:
+        vertical_rules = [
+            min(width - 1, max(0, int(value)))
+            for value in region.rectified_rules
+        ]
+    else:
+        vertical_rules = [
+            min(width - 1, max(0, round(x - left_source)))
+            for x in region.source_rules
+        ]
     vertical_rules[0] = 0
     vertical_rules[-1] = width - 1
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    header_bottom = darkest_rule_row(
-        gray, round(height * 0.035), round(height * 0.095)
-    )
-
-    # The daily body occupies a stable fraction after mapping the outer table
-    # borders to a rectangle.  The day-number ink still proves every one of
-    # the 31 rows; this boundary only prevents the first statistics row from
-    # becoming a false day anchor.
-    statistics_top = round(height * 0.780)
+    if region.rectified_boundaries:
+        table_top = int(region.rectified_boundaries.get("table_top", 0))
+        header_bottom = int(region.rectified_boundaries["header_bottom"])
+        statistics_top = int(region.rectified_boundaries["statistics_top"])
+    else:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        table_top = 0
+        header_bottom = darkest_rule_row(
+            gray, round(height * 0.035), round(height * 0.095)
+        )
+        statistics_top = round(height * 0.780)
+    if not (
+        0 <= table_top < header_bottom < statistics_top < height
+        and statistics_top - header_bottom >= height * 0.35
+    ):
+        raise RuntimeError("非刚性矫正后的四条边界次序或逐日区高度异常。")
     candidates = build_day_column_candidates(
         image, vertical_rules, header_bottom + 2, statistics_top - 2
     )
     anchor_method = "day-column-projection"
     try:
         anchors = choose_31_anchors(
-            candidates, header_bottom + 2, statistics_top - 2
+            candidates,
+            header_bottom + 2,
+            statistics_top - 2,
+            minimum_support_columns=2,
+        )
+        validate_anchor_rhythm(
+            anchors, header_bottom + 2, statistics_top - 2
         )
     except RuntimeError as day_error:
         candidates = build_multicolumn_support_candidates(
@@ -936,20 +3638,23 @@ def detect_rectified_geometry(
             anchors = choose_31_anchors(
                 candidates, header_bottom + 2, statistics_top - 2
             )
+            validate_anchor_rhythm(
+                anchors, header_bottom + 2, statistics_top - 2
+            )
         except RuntimeError as support_error:
             raise RuntimeError(
                 "日列锚点失败，跨列一致性锚点也失败："
                 f"日列={day_error}；跨列={support_error}"
             ) from support_error
         anchor_method = "multicolumn-support-projection"
-    horizontal_rules = [0, header_bottom, statistics_top, height - 1]
+    horizontal_rules = [table_top, header_bottom, statistics_top, height - 1]
     return PageGeometry(
         page=region.page,
         table_index=region.table_index,
         width=width,
         height=height,
         table_left=0,
-        table_top=0,
+        table_top=table_top,
         table_right=width - 1,
         header_bottom=header_bottom,
         statistics_top=statistics_top,
@@ -958,6 +3663,7 @@ def detect_rectified_geometry(
         candidate_anchors=candidates,
         row_anchors=anchors,
         anchor_method=anchor_method,
+        source_region_diagnostics=dict(region.diagnostics),
     )
 
 
@@ -1600,7 +4306,7 @@ def fit_dynamic_vertical_rule_models(
                     (y2, x2, segment_weight),
                 ]
             )
-    models: list[list[float]] = []
+    fitted_models: list[np.ndarray | None] = []
     for rule_index, nominal_x in enumerate(geometry.vertical_rules):
         observed_y: list[float] = []
         observed_x: list[float] = []
@@ -1635,7 +4341,7 @@ def fit_dynamic_vertical_rule_models(
             observed_weight.append(float(hough_weight))
 
         if len(observed_y) < 12:
-            models.append([0.0, 0.0, float(nominal_x)])
+            fitted_models.append(None)
             continue
         ys = np.asarray(observed_y, dtype=float)
         xs = np.asarray(observed_x, dtype=float)
@@ -1664,9 +4370,59 @@ def fit_dynamic_vertical_rule_models(
             not np.all(np.isfinite(check_x))
             or float(np.max(np.abs(check_x - nominal_x))) > search_radius * 1.05
         ):
-            coefficients = np.asarray([0.0, 0.0, float(nominal_x)])
-        models.append([float(value) for value in coefficients])
-    geometry.vertical_rule_models = models
+            fitted_models.append(None)
+        else:
+            fitted_models.append(np.asarray(coefficients, dtype=float))
+
+    # A failed local track must inherit the photographed bend/slant from its
+    # neighbouring rules, not collapse to a vertical x=constant line.  Linear
+    # interpolation of correction polynomials preserves ordered spacing and is
+    # especially important near the curved right edge of close photographs.
+    good_indices = [
+        index for index, model in enumerate(fitted_models) if model is not None
+    ]
+    if good_indices:
+        corrections = {
+            index: np.asarray(fitted_models[index], dtype=float)
+            - np.asarray(
+                [0.0, 0.0, float(geometry.vertical_rules[index])],
+                dtype=float,
+            )
+            for index in good_indices
+        }
+        shared_correction = np.median(
+            np.stack(list(corrections.values())), axis=0
+        )
+    else:
+        corrections = {}
+        shared_correction = np.zeros(3, dtype=float)
+    for index, model in enumerate(fitted_models):
+        if model is not None:
+            continue
+        left_candidates = [value for value in good_indices if value < index]
+        right_candidates = [value for value in good_indices if value > index]
+        left_index = max(left_candidates) if left_candidates else None
+        right_index = min(right_candidates) if right_candidates else None
+        if left_index is not None and right_index is not None:
+            fraction = (index - left_index) / (right_index - left_index)
+            correction = (
+                corrections[left_index] * (1.0 - fraction)
+                + corrections[right_index] * fraction
+            )
+        elif left_index is not None:
+            correction = corrections[left_index]
+        elif right_index is not None:
+            correction = corrections[right_index]
+        else:
+            correction = shared_correction
+        fitted_models[index] = correction + np.asarray(
+            [0.0, 0.0, float(geometry.vertical_rules[index])], dtype=float
+        )
+
+    geometry.vertical_rule_models = [
+        [float(value) for value in np.asarray(model, dtype=float)]
+        for model in fitted_models
+    ]
 
 
 def vertical_rule_x(geometry: PageGeometry, rule_index: int, y: float) -> float:
@@ -2094,12 +4850,14 @@ def align_observed_sequence_to_days(
 
     ordered = sorted(observations, key=lambda item: item["y"])
     observation_count = len(ordered)
-    if observation_count < 2 or observation_count > printed_days:
+    if observation_count < 2:
+        return None
+    # Only a small excess is credible.  A denser track is more likely a digit
+    # edge, ruled line, or halftone rhythm than a set of decimal points.
+    if observation_count > printed_days + 2:
         return None
     y_values = np.asarray([item["y"] for item in ordered], dtype=float)
     infinity = float("inf")
-    costs = np.full((observation_count, printed_days), infinity, dtype=float)
-    previous = np.full((observation_count, printed_days), -1, dtype=int)
     offset_min, offset_max = offset_range
 
     def offset_penalty(value: float) -> float:
@@ -2109,73 +4867,241 @@ def align_observed_sequence_to_days(
             return (value - offset_max) / row_pitch
         return 0.0
 
-    for day_index in range(printed_days):
-        residual = y_values[0] - preliminary[day_index]
-        costs[0, day_index] = (
-            day_index * 0.24 + offset_penalty(residual) * 2.2
-        )
-
-    for observation_index in range(1, observation_count):
-        observed_gap = y_values[observation_index] - y_values[observation_index - 1]
-        for day_index in range(observation_index, printed_days):
-            residual = y_values[observation_index] - preliminary[day_index]
-            point_cost = offset_penalty(residual) * 1.25
-            for prior_day in range(observation_index - 1, day_index):
-                prior_cost = costs[observation_index - 1, prior_day]
-                if not np.isfinite(prior_cost):
-                    continue
-                expected_gap = base_centers[day_index] - base_centers[prior_day]
-                gap_error = abs(observed_gap - expected_gap) / row_pitch
-                skipped_days = day_index - prior_day - 1
-                candidate = (
-                    prior_cost
-                    + gap_error * 2.35
-                    + skipped_days * 0.27
-                    + point_cost
-                )
-                if candidate < costs[observation_index, day_index]:
-                    costs[observation_index, day_index] = candidate
-                    previous[observation_index, day_index] = prior_day
-
-    last_costs = costs[-1].copy()
-    for day_index in range(printed_days):
-        last_costs[day_index] += (printed_days - day_index - 1) * 0.20
-    last_day = int(np.argmin(last_costs))
-    if not np.isfinite(last_costs[last_day]):
-        return None
-    path = [last_day]
-    for observation_index in range(observation_count - 1, 0, -1):
-        last_day = int(previous[observation_index, last_day])
-        if last_day < 0:
+    def finalize_path(
+        observation_path: list[int], day_path: list[int]
+    ) -> tuple[dict[int, dict[str, float]], float] | None:
+        if len(day_path) < 2:
             return None
-        path.append(last_day)
-    path.reverse()
-
-    # Reject a mathematically possible but geometrically implausible path.
-    if observation_count > 1:
-        transition_errors = []
-        for index in range(1, observation_count):
-            observed_gap = y_values[index] - y_values[index - 1]
-            expected_gap = base_centers[path[index]] - base_centers[path[index - 1]]
-            date_span = max(1, path[index] - path[index - 1])
+        transition_errors: list[float] = []
+        for index in range(1, len(day_path)):
+            observed_gap = (
+                y_values[observation_path[index]]
+                - y_values[observation_path[index - 1]]
+            )
+            expected_gap = (
+                base_centers[day_path[index]]
+                - base_centers[day_path[index - 1]]
+            )
+            date_span = max(1, day_path[index] - day_path[index - 1])
             transition_errors.append(
                 abs(observed_gap - expected_gap) / date_span
             )
         if float(np.median(transition_errors)) > row_pitch * 0.34:
             return None
-
-    mapping = {
-        int(day_index): item for day_index, item in zip(path, ordered)
-    }
-    raw_offset = float(
-        np.median(
-            [
-                item["y"] - preliminary[day_index]
-                for day_index, item in mapping.items()
-            ]
+        mapping = {
+            int(day_index): ordered[observation_index]
+            for observation_index, day_index in zip(
+                observation_path, day_path
+            )
+        }
+        raw_offset = float(
+            np.median(
+                [
+                    item["y"] - preliminary[day_index]
+                    for day_index, item in mapping.items()
+                ]
+            )
         )
+        return mapping, raw_offset
+
+    if observation_count <= printed_days:
+        # Preserve the proven sparse-sequence solver exactly: when the track is
+        # not overfull, every observation is evidence and may skip only dates.
+        costs = np.full(
+            (observation_count, printed_days), infinity, dtype=float
+        )
+        previous = np.full(
+            (observation_count, printed_days), -1, dtype=int
+        )
+        for day_index in range(printed_days):
+            residual = y_values[0] - preliminary[day_index]
+            costs[0, day_index] = (
+                day_index * 0.24 + offset_penalty(residual) * 2.2
+            )
+        for observation_index in range(1, observation_count):
+            observed_gap = (
+                y_values[observation_index]
+                - y_values[observation_index - 1]
+            )
+            for day_index in range(observation_index, printed_days):
+                residual = y_values[observation_index] - preliminary[day_index]
+                point_cost = offset_penalty(residual) * 1.25
+                for prior_day in range(observation_index - 1, day_index):
+                    prior_cost = costs[observation_index - 1, prior_day]
+                    if not np.isfinite(prior_cost):
+                        continue
+                    expected_gap = (
+                        base_centers[day_index] - base_centers[prior_day]
+                    )
+                    gap_error = abs(observed_gap - expected_gap) / row_pitch
+                    skipped_days = day_index - prior_day - 1
+                    candidate = (
+                        prior_cost
+                        + gap_error * 2.35
+                        + skipped_days * 0.27
+                        + point_cost
+                    )
+                    if candidate < costs[observation_index, day_index]:
+                        costs[observation_index, day_index] = candidate
+                        previous[observation_index, day_index] = prior_day
+        last_costs = costs[-1].copy()
+        for day_index in range(printed_days):
+            last_costs[day_index] += (
+                printed_days - day_index - 1
+            ) * 0.20
+        last_day = int(np.argmin(last_costs))
+        if not np.isfinite(last_costs[last_day]):
+            return None
+        day_path = [last_day]
+        for observation_index in range(observation_count - 1, 0, -1):
+            last_day = int(previous[observation_index, last_day])
+            if last_day < 0:
+                return None
+            day_path.append(last_day)
+        day_path.reverse()
+        return finalize_path(list(range(observation_count)), day_path)
+
+    # Overfull tracks use a bounded third state: the number of rejected
+    # observations.  Existing sparse behaviour remains untouched, while up to
+    # two statistics/dirt points can be discarded anywhere in the sequence.
+    maximum_rejections = min(3, observation_count - 2)
+    minimum_rejections = observation_count - printed_days
+    rejection_penalty = 0.95
+    costs = np.full(
+        (
+            observation_count,
+            printed_days,
+            maximum_rejections + 1,
+        ),
+        infinity,
+        dtype=float,
     )
-    return mapping, raw_offset
+    previous_observation = np.full(costs.shape, -1, dtype=int)
+    previous_day = np.full(costs.shape, -1, dtype=int)
+    previous_rejections = np.full(costs.shape, -1, dtype=int)
+    for observation_index in range(
+        min(observation_count, maximum_rejections + 1)
+    ):
+        rejected = observation_index
+        for day_index in range(printed_days):
+            residual = y_values[observation_index] - preliminary[day_index]
+            costs[observation_index, day_index, rejected] = (
+                rejected * rejection_penalty
+                + day_index * 0.24
+                + offset_penalty(residual) * 2.2
+            )
+    for observation_index in range(1, observation_count):
+        for day_index in range(1, printed_days):
+            residual = y_values[observation_index] - preliminary[day_index]
+            point_cost = offset_penalty(residual) * 1.25
+            for prior_observation in range(observation_index):
+                rejected_between = observation_index - prior_observation - 1
+                if rejected_between > maximum_rejections:
+                    continue
+                observed_gap = (
+                    y_values[observation_index]
+                    - y_values[prior_observation]
+                )
+                for prior_day_index in range(day_index):
+                    expected_gap = (
+                        base_centers[day_index]
+                        - base_centers[prior_day_index]
+                    )
+                    gap_error = abs(observed_gap - expected_gap) / row_pitch
+                    skipped_days = day_index - prior_day_index - 1
+                    for prior_rejected in range(
+                        maximum_rejections - rejected_between + 1
+                    ):
+                        prior_cost = costs[
+                            prior_observation,
+                            prior_day_index,
+                            prior_rejected,
+                        ]
+                        if not np.isfinite(prior_cost):
+                            continue
+                        rejected = prior_rejected + rejected_between
+                        candidate = (
+                            prior_cost
+                            + rejected_between * rejection_penalty
+                            + gap_error * 2.35
+                            + skipped_days * 0.27
+                            + point_cost
+                        )
+                        if candidate < costs[
+                            observation_index, day_index, rejected
+                        ]:
+                            costs[
+                                observation_index, day_index, rejected
+                            ] = candidate
+                            previous_observation[
+                                observation_index, day_index, rejected
+                            ] = prior_observation
+                            previous_day[
+                                observation_index, day_index, rejected
+                            ] = prior_day_index
+                            previous_rejections[
+                                observation_index, day_index, rejected
+                            ] = prior_rejected
+
+    # Prefer the smallest rejection count that produces a geometrically valid
+    # path.  This maximizes retained real dots before comparing score details.
+    for total_rejections in range(
+        minimum_rejections, maximum_rejections + 1
+    ):
+        endpoints: list[tuple[float, int, int, int]] = []
+        for observation_index in range(observation_count):
+            trailing = observation_count - observation_index - 1
+            rejected_before = total_rejections - trailing
+            if not 0 <= rejected_before <= maximum_rejections:
+                continue
+            for day_index in range(printed_days):
+                cost = costs[
+                    observation_index, day_index, rejected_before
+                ]
+                if not np.isfinite(cost):
+                    continue
+                endpoints.append(
+                    (
+                        float(
+                            cost
+                            + trailing * rejection_penalty
+                            + (printed_days - day_index - 1) * 0.20
+                        ),
+                        observation_index,
+                        day_index,
+                        rejected_before,
+                    )
+                )
+        for _, last_observation, last_day, rejected in sorted(endpoints):
+            observation_path = [last_observation]
+            day_path = [last_day]
+            while True:
+                prior_observation = int(
+                    previous_observation[last_observation, last_day, rejected]
+                )
+                prior_day_index = int(
+                    previous_day[last_observation, last_day, rejected]
+                )
+                prior_rejected = int(
+                    previous_rejections[last_observation, last_day, rejected]
+                )
+                if (
+                    prior_observation < 0
+                    or prior_day_index < 0
+                    or prior_rejected < 0
+                ):
+                    break
+                observation_path.append(prior_observation)
+                day_path.append(prior_day_index)
+                last_observation = prior_observation
+                last_day = prior_day_index
+                rejected = prior_rejected
+            observation_path.reverse()
+            day_path.reverse()
+            finalized = finalize_path(observation_path, day_path)
+            if finalized is not None:
+                return finalized
+    return None
 
 
 def detect_integer_token_centers_left_of_decimal(
@@ -2338,6 +5264,10 @@ def apply_month_decimal_anchors(
     virtual_diagnostics: list[dict[str, Any]] = []
 
     def maximum_printed_day(column: int) -> int:
+        if 0 < column <= len(geometry.month_lengths):
+            inferred = int(geometry.month_lengths[column - 1])
+            if 28 <= inferred <= 31:
+                return inferred
         if column == 2:
             return 29
         if column in (4, 6, 9, 11):
@@ -2710,11 +5640,85 @@ def fit_multicolumn_row_curves(
     weights[:, 0] = 5.0
 
     def maximum_printed_day(column: int) -> int:
+        if 0 < column <= len(geometry.month_lengths):
+            inferred = int(geometry.month_lengths[column - 1])
+            if 28 <= inferred <= 31:
+                return inferred
         if column == 2:
             return 29
         if column in (4, 6, 9, 11):
             return 30
         return 31
+
+    def refined_statistics_separator(
+        current_centers: np.ndarray,
+    ) -> list[float]:
+        """Fit the daily/statistics divider from the current month surface.
+
+        The first separator estimate is intentionally permissive because no
+        month-local row surface exists yet.  Once one does, the last legal date
+        supplies an independent lower bound for every column.  Running this
+        refinement before decimal anchoring keeps the first statistics row out
+        of the dot track; running it again after anchoring keeps crop geometry
+        synchronized with the final surface.
+        """
+
+        separator_lower_bounds: list[float] = []
+        for column in range(EXPECTED_COLUMN_COUNT):
+            printed_days = 31 if column == 0 else maximum_printed_day(column)
+            last_center = current_centers[printed_days - 1, column]
+            ink_lower_bound = last_center + max(3.0, row_pitch * 0.42)
+            separator_lower_bounds.append(float(ink_lower_bound))
+        samples = fit_statistics_separator_samples(
+            gray,
+            page_ink,
+            geometry,
+            centers_x,
+            row_pitch,
+            separator_lower_bounds,
+        )
+        for column in range(EXPECTED_COLUMN_COUNT):
+            samples[column] = min(
+                geometry.height - 2.0,
+                max(float(samples[column]), separator_lower_bounds[column]),
+            )
+        separator = np.asarray(samples, dtype=float)
+        lower_bounds = np.asarray(separator_lower_bounds, dtype=float)
+        local_median = cv2.medianBlur(
+            separator.astype(np.float32)[None, :], 3
+        ).reshape(-1).astype(float)
+        suspicious = np.abs(separator - local_median) > row_pitch * 0.42
+        separator[suspicious] = np.maximum(
+            lower_bounds[suspicious], local_median[suspicious]
+        )
+        separator_cap = max(3.0, row_pitch * 0.42)
+        for _ in range(3):
+            forward = separator.copy()
+            backward = separator.copy()
+            for column in range(1, EXPECTED_COLUMN_COUNT):
+                forward[column] = max(
+                    lower_bounds[column],
+                    float(
+                        np.clip(
+                            forward[column],
+                            forward[column - 1] - separator_cap,
+                            forward[column - 1] + separator_cap,
+                        )
+                    ),
+                )
+            for column in range(EXPECTED_COLUMN_COUNT - 2, -1, -1):
+                backward[column] = max(
+                    lower_bounds[column],
+                    float(
+                        np.clip(
+                            backward[column],
+                            backward[column + 1] - separator_cap,
+                            backward[column + 1] + separator_cap,
+                        )
+                    ),
+                )
+            separator = np.maximum(lower_bounds, (forward + backward) / 2)
+        return separator.astype(float).tolist()
 
     for column in range(1, EXPECTED_COLUMN_COUNT):
         reference_y = float(np.median(base_centers))
@@ -2907,6 +5911,11 @@ def fit_multicolumn_row_curves(
     fitted_displacement[:, 0] = 0.0
     fitted = base_centers[:, None] + fitted_displacement
 
+    # The permissive separator used for the first projection can include the
+    # first statistics row on a strongly curved page.  Tighten it now, before
+    # decimal components are enumerated, using the independent last-valid-day
+    # centers already available in every month.
+    statistics_samples = refined_statistics_separator(fitted)
     pre_anchor_fitted = fitted.copy()
     fitted = apply_month_decimal_anchors(
         image,
@@ -3020,67 +6029,9 @@ def fit_multicolumn_row_curves(
                 fitted[day_index + 1, column] - minimum_gap,
             )
 
-    # A separator estimate above the final valid glyph band is necessarily a
-    # digit stroke, not the statistics divider.  Enforce the independently
-    # observed last-row lower edge before it is used as a crop boundary.  The
-    # physical divider is also continuous across adjacent months, so isolated
-    # Hough minima are replaced by a lower-bounded, bounded-slope curve.
-    separator_lower_bounds: list[float] = []
-    for column in range(EXPECTED_COLUMN_COUNT):
-        printed_days = 31 if column == 0 else maximum_printed_day(column)
-        last_center = fitted[printed_days - 1, column]
-        ink_lower_bound = last_center + max(3.0, row_pitch * 0.42)
-        separator_lower_bounds.append(float(ink_lower_bound))
-    statistics_samples = fit_statistics_separator_samples(
-        gray,
-        page_ink,
-        geometry,
-        centers_x,
-        row_pitch,
-        separator_lower_bounds,
-    )
-    for column in range(EXPECTED_COLUMN_COUNT):
-        statistics_samples[column] = min(
-            geometry.height - 2.0,
-            max(float(statistics_samples[column]), separator_lower_bounds[column]),
-        )
-    separator = np.asarray(statistics_samples, dtype=float)
-    lower_bounds = np.asarray(separator_lower_bounds, dtype=float)
-    local_median = cv2.medianBlur(
-        separator.astype(np.float32)[None, :], 3
-    ).reshape(-1).astype(float)
-    suspicious = np.abs(separator - local_median) > row_pitch * 0.42
-    separator[suspicious] = np.maximum(
-        lower_bounds[suspicious], local_median[suspicious]
-    )
-    separator_cap = max(3.0, row_pitch * 0.42)
-    for _ in range(3):
-        forward = separator.copy()
-        backward = separator.copy()
-        for column in range(1, EXPECTED_COLUMN_COUNT):
-            forward[column] = max(
-                lower_bounds[column],
-                float(
-                    np.clip(
-                        forward[column],
-                        forward[column - 1] - separator_cap,
-                        forward[column - 1] + separator_cap,
-                    )
-                ),
-            )
-        for column in range(EXPECTED_COLUMN_COUNT - 2, -1, -1):
-            backward[column] = max(
-                lower_bounds[column],
-                float(
-                    np.clip(
-                        backward[column],
-                        backward[column + 1] - separator_cap,
-                        backward[column + 1] + separator_cap,
-                    )
-                ),
-            )
-        separator = np.maximum(lower_bounds, (forward + backward) / 2)
-    statistics_samples = separator.astype(float).tolist()
+    # Refit once more after month anchors and surface regularization so the
+    # exported crop boundary follows the same final geometry.
+    statistics_samples = refined_statistics_separator(fitted)
 
     center_reference_y = float(np.median(base_centers))
     geometry.column_center_x = [
@@ -3163,23 +6114,11 @@ def curved_cell_polygon(
         ]
     top_rules = curve_values_at_rules(geometry, top_values)
     bottom_rules = curve_values_at_rules(geometry, bottom_values)
-    month_lengths = (
-        geometry.month_lengths
-        if len(geometry.month_lengths) == 12
-        else LEAP_MONTH_LENGTHS
-    )
-    if (
-        day_index == month_lengths[month - 1] - 1
-        and geometry.statistics_curve
-    ):
-        statistics_rules = curve_values_at_rules(
-            geometry, geometry.statistics_curve
-        )
-        # The separator itself is the only non-ink lower boundary for the
-        # final valid date.  Calendar-virtual centers are diagnostic controls
-        # and never determine this crop edge.
-        bottom_rules[month] = statistics_rules[month] - 1.0
-        bottom_rules[month + 1] = statistics_rules[month + 1] - 1.0
+    # Calendar-invalid trailing centers are deliberate geometry controls.  A
+    # month-end crop must close at the midpoint to the following virtual row,
+    # exactly like every other date.  Extending it to the statistics separator
+    # creates a 2-5x-tall crop that contains several rows and the first summary
+    # rule (the former source of systematic Feb/Apr/Jun/Sep/Nov failures).
     top_left_x = vertical_rule_x(geometry, month, top_rules[month])
     top_right_x = vertical_rule_x(geometry, month + 1, top_rules[month + 1])
     bottom_right_x = vertical_rule_x(
@@ -3286,25 +6225,104 @@ def cell_has_ink(cell: np.ndarray | None) -> bool:
     return int(np.count_nonzero(ink)) >= max(8, round(ink.size * 0.008))
 
 
+def numeric_glyph_shape_evidence(cell: np.ndarray | None) -> bool:
+    """Reject border fragments/bleed-through before asking OCR about Feb 29."""
+
+    if cell is None or cell.size == 0:
+        return False
+    gray = cv2.cvtColor(cell, cv2.COLOR_BGR2GRAY)
+    ink = cv2.threshold(
+        gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU
+    )[1]
+    height, width = ink.shape
+    inset_y = max(1, round(height * 0.04))
+    inset_x = max(1, round(width * 0.03))
+    core = ink[inset_y : height - inset_y, inset_x : width - inset_x]
+    ys, xs = np.nonzero(core)
+    if ys.size < max(8, round(core.size * 0.006)):
+        return False
+    vertical_span = float(np.max(ys) - np.min(ys) + 1) / max(1, core.shape[0])
+    centroid_y = float(np.mean(ys)) / max(1, core.shape[0] - 1)
+    lower_extent = float(np.max(ys)) / max(1, core.shape[0] - 1)
+    ink_ratio = float(ys.size / max(1, core.size))
+    return bool(
+        vertical_span >= 0.30
+        and 0.25 <= centroid_y <= 0.74
+        and lower_extent >= 0.46
+        and 0.006 <= ink_ratio <= 0.58
+    )
+
+
+def recognize_numeric_cell_evidence(
+    cell: np.ndarray,
+    recognizers: list[TextRecognition | None],
+) -> list[dict[str, Any]]:
+    """Return OCR votes that contain a plausible numeric flow value."""
+
+    votes: list[dict[str, Any]] = []
+    for recognizer in recognizers:
+        if recognizer is None:
+            continue
+        try:
+            prediction = next(
+                iter(recognizer.predict(input=[cell], batch_size=1))
+            )
+            text, confidence = result_value(prediction)
+        except Exception:
+            continue
+        normalized = normalized_numeric_text(str(text))
+        value = parse_flow(normalized)
+        digit_count = len(re.findall(r"\d", normalized))
+        if value is None or digit_count < 1 or float(confidence) < 0.35:
+            continue
+        votes.append(
+            {
+                "text": str(text),
+                "confidence": float(confidence),
+                "value": float(value),
+            }
+        )
+    return votes
+
+
 def infer_month_lengths(
-    image: np.ndarray, geometry: PageGeometry
+    image: np.ndarray,
+    geometry: PageGeometry,
+    primary_recognizer: TextRecognition | None = None,
+    secondary_recognizer: TextRecognition | None = None,
 ) -> list[int]:
-    day_29_top, day_29_bottom = anchor_row_bounds(
-        geometry.row_anchors,
-        28,
-        geometry.header_bottom + 2,
-        geometry.statistics_top - 1,
+    """Infer leap year from a tight, curve-aware Feb-29 numeric cell.
+
+    Mere ink is not enough: a dust spot, grid fragment or bleed-through once
+    turned a single 1975 table into 366 rows.  The cell must contain a centered
+    digit-like component and at least one OCR model must produce a number.
+    """
+
+    column_width = geometry.vertical_rules[3] - geometry.vertical_rules[2]
+    cell_inset = max(3, round(column_width * 0.060))
+    polygon = curved_cell_polygon(geometry, 2, 28)
+    february_cell = prepare_curved_cell(image, polygon, cell_inset)
+    shape_evidence = numeric_glyph_shape_evidence(february_cell)
+    votes = (
+        recognize_numeric_cell_evidence(
+            february_cell,
+            [primary_recognizer, secondary_recognizer],
+        )
+        if shape_evidence and february_cell is not None
+        else []
     )
-    february_cell = prepare_cell(
-        image,
-        (
-            geometry.vertical_rules[2] + 2,
-            day_29_top,
-            geometry.vertical_rules[3] - 2,
-            day_29_bottom,
-        ),
+    leap = bool(votes)
+    geometry.source_region_diagnostics["calendar_inference"] = {
+        "method": "curve-aware-february-29-numeric-evidence",
+        "shape_evidence": bool(shape_evidence),
+        "ocr_votes": votes,
+        "calendar": "leap" if leap else "common",
+    }
+    return (
+        LEAP_MONTH_LENGTHS.copy()
+        if leap
+        else COMMON_MONTH_LENGTHS.copy()
     )
-    return LEAP_MONTH_LENGTHS.copy() if cell_has_ink(february_cell) else COMMON_MONTH_LENGTHS.copy()
 
 
 def segment_title_crops(
@@ -3359,49 +6377,198 @@ def segment_title_crops(
     return crop, parts
 
 
+def parse_region_title_text(
+    title_text: str, page: int, table_index: int
+) -> dict[str, str]:
+    """Parse table number, river, station and optional in/outflow scope."""
+
+    compact = re.sub(r"\s+", "", str(title_text))
+    compact = compact.replace("(", "（").replace(")", "）")
+    # In small photographed headings OCR commonly confuses 逐 with 遂.  Limit
+    # the correction to the fixed table-title phrase so genuine station names
+    # are never rewritten.
+    compact = re.sub(r"遂日(?=平均流量|平均)", "逐日", compact)
+    table_match = re.match(r"(\d{1,5})", compact)
+    table_number = table_match.group(1) if table_match else ""
+    prefix = re.sub(r"^\d+", "", compact)
+    prefix = re.split(
+        r"(?:逐|遂)(?:日)?(?:平均|均)?(?:流量|流)?"
+        r"|日平均|平均流量|集水面积|流量以",
+        prefix,
+    )[0]
+    scope_match = re.search(
+        r"(?P<scope>总?(?:入库|出库)(?:流量)?)$", prefix
+    )
+    flow_scope = scope_match.group("scope") if scope_match else ""
+    if scope_match:
+        prefix = prefix[: scope_match.start()]
+
+    river = ""
+    station = ""
+    station_matches = list(
+        re.finditer(r"([\u4e00-\u9fff·（）]+站)", prefix)
+    )
+    station_label = station_matches[-1].group(1) if station_matches else ""
+    if station_label:
+        river_match = re.match(
+            r"(.+?(?:江|河|溪|沟|湖|渠|水库))(.+?站)$",
+            station_label,
+        )
+        if river_match:
+            river_candidate, station_candidate = river_match.groups()
+            if (
+                len(river_candidate) >= 2
+                and not station_candidate.startswith("（")
+            ):
+                river = river_candidate
+                station = station_candidate
+            else:
+                station = station_label
+        else:
+            station = station_label
+    if not station:
+        station = f"第{page}页表{table_index}站点"
+    return {
+        "table_number": table_number,
+        "river": river,
+        "station": station,
+        "flow_scope": flow_scope,
+    }
+
+
+def station_name_quality(station: str) -> float:
+    """Score structural completeness without using a station-name whitelist."""
+
+    compact = re.sub(r"\s+", "", str(station)).replace("(", "（").replace(")", "）")
+    if not compact or compact.startswith("第") or not compact.endswith("站"):
+        return -100.0
+    if compact.startswith("）") or compact.count("（") != compact.count("）"):
+        return -40.0
+    if "）（" in compact:
+        return -20.0
+    han_count = len(re.findall(r"[\u4e00-\u9fff]", compact[:-1]))
+    if han_count < 2:
+        return -30.0
+    # Length is only a weak completeness cue.  Giving it dominant weight makes
+    # a missed river suffix ("那龙 合山站") look like one long station name and
+    # beat a clearer candidate that correctly separates "那龙河 / 合山站".
+    score = float(4.0 + min(han_count, 6) * 0.20 + min(len(compact), 14) * 0.05)
+    if "水库" in compact:
+        score += 1.5
+    if "（" in compact and "）" in compact:
+        score += 0.8
+    return score
+
+
+def title_candidate_score(
+    text: str,
+    confidence: float,
+    page: int,
+    table_index: int,
+) -> tuple[float, dict[str, str]]:
+    parsed = parse_region_title_text(text, page, table_index)
+    compact = re.sub(r"\s+", "", str(text))
+    score = station_name_quality(parsed["station"])
+    if re.search(r"(?:逐|遂)(?:日)?(?:平均|均)?(?:流量|流)?", compact):
+        score += 3.0
+    if parsed["table_number"]:
+        score += 0.8
+    if parsed["river"]:
+        score += 1.5
+    if parsed["flow_scope"]:
+        score += 0.5
+    score += max(0.0, min(1.0, float(confidence))) * 1.2
+    return score, parsed
+
+
+def enhanced_title_crop_variants(crop: np.ndarray) -> list[np.ndarray]:
+    """Create scale/contrast variants for faint or partially clipped headings."""
+
+    if crop.size == 0:
+        return [crop]
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 4)).apply(gray)
+    enhanced = cv2.cvtColor(clahe, cv2.COLOR_GRAY2BGR)
+    enlarged = cv2.resize(
+        enhanced,
+        None,
+        fx=1.55,
+        fy=1.55,
+        interpolation=cv2.INTER_CUBIC,
+    )
+    return [crop, enhanced, enlarged]
+
+
+def choose_title_recognition(
+    recognized: list[tuple[str, float]],
+    page: int,
+    table_index: int,
+) -> tuple[str, float, dict[str, str]]:
+    if not recognized:
+        parsed = parse_region_title_text("", page, table_index)
+        return "", 0.0, parsed
+    candidates: list[
+        tuple[float, int, str, float, dict[str, str]]
+    ] = []
+    for text, confidence in recognized:
+        score, parsed = title_candidate_score(
+            str(text), float(confidence), page, table_index
+        )
+        candidates.append(
+            (score, len(re.sub(r"\s+", "", str(text))), str(text), float(confidence), parsed)
+        )
+    _, _, text, confidence, parsed = max(
+        candidates, key=lambda item: (item[0], item[1], item[3])
+    )
+    return text, confidence, parsed
+
+
 def recognize_page_heading(
     image: np.ndarray,
     geometry: PageGeometry,
     recognizer: TextRecognition,
 ) -> dict[str, Any]:
     title_crop, parts = segment_title_crops(image, geometry)
-    crops = [title_crop] + parts
+    crops = enhanced_title_crop_variants(title_crop) + parts
     predictions = list(recognizer.predict(input=crops, batch_size=len(crops)))
     recognized = [result_value(prediction) for prediction in predictions]
-    full_text, full_confidence = recognized[0]
+    full_text, full_confidence, parsed = choose_title_recognition(
+        recognized, geometry.page, geometry.table_index
+    )
     part_results = [
         {"text": text, "confidence": confidence}
-        for text, confidence in recognized[1:]
+        for text, confidence in recognized
         if str(text).strip()
     ]
-
-    station = ""
-    river = ""
-    table_number = ""
+    station = parsed["station"]
+    river = parsed["river"]
+    table_number = parsed["table_number"]
+    flow_scope = parsed["flow_scope"]
     for index, item in enumerate(part_results):
         text = re.sub(r"\s+", "", str(item["text"]))
-        if not table_number and re.fullmatch(r"\d{1,5}", text):
-            table_number = text
-        if text.endswith("站") and "流量" not in text:
+        part_parsed = parse_region_title_text(
+            text, geometry.page, geometry.table_index
+        )
+        if not table_number:
+            table_number = part_parsed["table_number"]
+            if not table_number and re.fullmatch(r"\d{1,5}", text):
+                table_number = text
+        if not flow_scope and part_parsed["flow_scope"]:
+            flow_scope = part_parsed["flow_scope"]
+        if station.startswith("第") and not part_parsed["station"].startswith("第"):
+            station = part_parsed["station"]
+            river = part_parsed["river"]
+        if station.startswith("第") and text.endswith("站") and "流量" not in text:
             station = text
-            if index > 0:
-                previous = re.sub(
-                    r"\s+", "", str(part_results[index - 1]["text"])
-                )
-                if re.fullmatch(r"[\u4e00-\u9fff·（）()]+", previous):
-                    river = previous
+        if not river and index > 0 and not station.startswith("第"):
+            previous = re.sub(
+                r"\s+", "", str(part_results[index - 1]["text"])
+            )
+            if re.fullmatch(r"[\u4e00-\u9fff·（）()]+", previous):
+                river = previous
 
-    compact = re.sub(r"\s+", "", full_text)
-    if not table_number:
-        match = re.match(r"(\d{1,5})", compact)
-        table_number = match.group(1) if match else ""
-    if not station:
-        prefix = re.sub(r"^\d+", "", compact)
-        prefix = re.split(r"逐日|平均流量", prefix)[0]
-        match = re.search(r"([\u4e00-\u9fff·（）()]+站)$", prefix)
-        station = match.group(1) if match else ""
     station = re.sub(r"\s+", "", station).replace("(", "（").replace(")", "）")
-    if not station:
+    if not station or station.startswith("第"):
         station = f"第{geometry.page}页站点"
 
     span = geometry.table_right - geometry.table_left
@@ -3421,6 +6588,7 @@ def recognize_page_heading(
         "table_number": table_number,
         "river": river,
         "station": station,
+        "flow_scope": flow_scope,
         "title_text": full_text,
         "title_confidence": full_confidence,
         "title_parts": part_results,
@@ -3441,10 +6609,27 @@ def recognize_region_heading(
     page_height, page_width = source_image.shape[:2]
     left, top, right, _ = region.source_bbox
     span = right - left
-    title_crop = source_image[
-        max(0, top - round(page_height * 0.038)) : max(1, top - round(page_height * 0.008)),
-        max(0, left - round(span * 0.01)) : min(page_width, left + round(span * 0.76)),
+    title_crops = [
+        source_image[
+            max(0, top - round(page_height * 0.038)) : max(
+                1, top - round(page_height * 0.008)
+            ),
+            max(0, left - round(span * 0.01)) : min(
+                page_width, left + round(span * 0.76)
+            ),
+        ],
+        source_image[
+            max(0, top - round(page_height * 0.052)) : max(
+                1, top - round(page_height * 0.002)
+            ),
+            max(0, left - round(span * 0.025)) : min(
+                page_width, left + round(span * 0.90)
+            ),
+        ],
     ]
+    title_variants: list[np.ndarray] = []
+    for title_crop in title_crops:
+        title_variants.extend(enhanced_title_crop_variants(title_crop))
     metadata_crops = [
         source_image[
             max(0, top - round(page_height * 0.025)) : max(
@@ -3463,32 +6648,23 @@ def recognize_region_heading(
             max(0, left + round(span * 0.72)) : min(page_width, right),
         ],
     ]
-    predictions = list(
+    title_predictions = list(
         recognizer.predict(
-            input=[title_crop, *metadata_crops], batch_size=4
+            input=title_variants, batch_size=len(title_variants)
         )
     )
-    title_text, title_confidence = result_value(predictions[0])
-    metadata_results = [result_value(item) for item in predictions[1:]]
-    metadata_text = " | ".join(text for text, _ in metadata_results)
-    metadata_confidence = max(confidence for _, confidence in metadata_results)
-    compact = re.sub(r"\s+", "", str(title_text))
-    table_match = re.match(r"(\d{1,5})", compact)
-    table_number = table_match.group(1) if table_match else ""
-    prefix = re.split(r"逐日|平均流量", re.sub(r"^\d+", "", compact))[0]
-    river = ""
-    station = ""
-    river_match = re.match(
-        r"(.+?(?:江|河|溪|沟|湖|渠|水库))(.+?站)$", prefix
+    title_results = [result_value(item) for item in title_predictions]
+    title_text, title_confidence, parsed = choose_title_recognition(
+        title_results, region.page, region.table_index
     )
-    if river_match:
-        river, station = river_match.groups()
-    else:
-        station_match = re.search(r"([\u4e00-\u9fff·（）()]+站)$", prefix)
-        station = station_match.group(1) if station_match else ""
-    station = station.replace("(", "（").replace(")", "）")
-    if not station:
-        station = f"第{region.page}页表{region.table_index}站点"
+    metadata_predictions = list(
+        recognizer.predict(input=metadata_crops, batch_size=len(metadata_crops))
+    )
+    metadata_results = [result_value(item) for item in metadata_predictions]
+    metadata_text = " | ".join(text for text, _ in metadata_results)
+    metadata_confidence = max(
+        (confidence for _, confidence in metadata_results), default=0.0
+    )
     metadata_compact = re.sub(r"\s+", "", str(metadata_text))
     area_candidates = re.findall(
         r"(\d+(?:\.\d+)?)\s*(?=k?m|k㎡|平方)",
@@ -3502,12 +6678,17 @@ def recognize_region_heading(
     area_text = max(area_candidates, key=len) if area_candidates else ""
     catchment_area = float(area_text) if area_text else None
     return {
-        "table_number": table_number,
-        "river": river,
-        "station": station,
+        "table_number": parsed["table_number"],
+        "river": parsed["river"],
+        "station": parsed["station"],
+        "flow_scope": parsed["flow_scope"],
         "title_text": title_text,
         "title_confidence": title_confidence,
-        "title_parts": [],
+        "title_parts": [
+            {"text": text, "confidence": confidence}
+            for text, confidence in title_results
+            if str(text).strip()
+        ],
         "metadata_text": metadata_text,
         "metadata_confidence": metadata_confidence,
         "catchment_area_km2": catchment_area,
@@ -3550,6 +6731,7 @@ def geometry_to_json(geometry: PageGeometry) -> dict[str, Any]:
             for coefficients in geometry.vertical_rule_models
         ],
         "horizontal_rules": geometry.horizontal_rules,
+        "source_region_diagnostics": geometry.source_region_diagnostics,
         "anchor_method": geometry.anchor_method,
         "candidate_anchor_count": len(geometry.candidate_anchors),
         "candidate_anchors": [
@@ -3660,9 +6842,23 @@ def recognize_daily_cells(
     batch_size: int,
     low_confidence: float,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[int]]:
-    month_lengths = infer_month_lengths(image, geometry)
-    geometry.month_lengths = list(month_lengths)
+    # Fit once with a provisional Feb-29 control point so the calendar probe
+    # can use the same non-rigid row/column surface as ordinary cells.
+    geometry.month_lengths = LEAP_MONTH_LENGTHS.copy()
     fit_multicolumn_row_curves(image, geometry)
+    month_lengths = infer_month_lengths(
+        image,
+        geometry,
+        primary_recognizer,
+        secondary_recognizer,
+    )
+    if month_lengths != geometry.month_lengths:
+        geometry.month_lengths = list(month_lengths)
+        # Refit February so day 29 becomes a geometry-only virtual anchor in a
+        # common year and cannot attach itself to summary-row ink.
+        fit_multicolumn_row_curves(image, geometry)
+    else:
+        geometry.month_lengths = list(month_lengths)
     training_images_dir.mkdir(parents=True, exist_ok=True)
     crops: list[np.ndarray] = []
     samples: list[dict[str, Any]] = []
@@ -3858,6 +7054,77 @@ def synchronize_rows_from_samples(
         row["值来源"] = sample["value_source"]
         row["待确认"] = sample["include"] == "待确认"
         row["备注"] = sample["note"]
+
+
+def draw_source_curve_mesh_preview(
+    image: np.ndarray, regions: list[TableRegion], output_path: Path
+) -> None:
+    """Show the curved source-space mesh before it is flattened."""
+
+    preview = image.copy()
+    for region in regions:
+        diagnostics = region.diagnostics
+        boundary_values = diagnostics.get("source_boundary_y_at_rules", {})
+        track_diagnostics = diagnostics.get("source_vertical_rule_tracks", [])
+        if not boundary_values or len(track_diagnostics) != EXPECTED_VERTICAL_RULE_COUNT:
+            left, top, right, bottom = region.source_bbox
+            cv2.rectangle(preview, (left, top), (right, bottom), (255, 0, 255), 2)
+            continue
+        models = [
+            np.asarray(item["coefficients"], dtype=float)
+            for item in track_diagnostics
+        ]
+        colors = {
+            "table_top": (255, 0, 255),
+            "header_bottom": (0, 0, 255),
+            "statistics_top": (0, 0, 255),
+            "table_bottom": (255, 0, 255),
+        }
+        for name, color in colors.items():
+            y_values = np.asarray(boundary_values.get(name, []), dtype=float)
+            if len(y_values) != EXPECTED_VERTICAL_RULE_COUNT:
+                continue
+            points = np.asarray(
+                [
+                    [round(float(np.polyval(models[index], y))), round(float(y))]
+                    for index, y in enumerate(y_values)
+                ],
+                dtype=np.int32,
+            )
+            cv2.polylines(preview, [points], False, color, 2, cv2.LINE_AA)
+        top_values = np.asarray(boundary_values.get("table_top", []), dtype=float)
+        statistics_values = np.asarray(
+            boundary_values.get("statistics_top", []), dtype=float
+        )
+        if (
+            len(top_values) == EXPECTED_VERTICAL_RULE_COUNT
+            and len(statistics_values) == EXPECTED_VERTICAL_RULE_COUNT
+        ):
+            for index, model in enumerate(models):
+                sample_y = np.linspace(top_values[index], statistics_values[index], 90)
+                points = np.asarray(
+                    [
+                        [round(float(np.polyval(model, y))), round(float(y))]
+                        for y in sample_y
+                    ],
+                    dtype=np.int32,
+                )
+                cv2.polylines(
+                    preview, [points], False, (255, 200, 0), 1, cv2.LINE_AA
+                )
+            label_x = round(float(np.polyval(models[0], top_values[0])))
+            label_y = max(20, round(float(top_values[0])) - 10)
+            cv2.putText(
+                preview,
+                f"T{region.table_index}",
+                (label_x, label_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 0, 255),
+                2,
+                cv2.LINE_AA,
+            )
+    cv2.imwrite(str(output_path), preview)
 
 
 def draw_anchor_preview(
@@ -4084,6 +7351,35 @@ def draw_cell_preview(
     cv2.imwrite(str(output_path), preview)
 
 
+def save_workbook_with_lock_fallback(workbook: Workbook, path: Path) -> Path:
+    """Save normally, or use a stable update suffix when Excel holds a lock."""
+
+    try:
+        workbook.save(path)
+        return path
+    except PermissionError:
+        fallback = path.with_name(f"{path.stem}_更新{path.suffix}")
+        try:
+            workbook.save(fallback)
+        except PermissionError:
+            for occurrence in range(2, 100):
+                candidate = path.with_name(
+                    f"{path.stem}_更新_{occurrence:02d}{path.suffix}"
+                )
+                try:
+                    workbook.save(candidate)
+                    fallback = candidate
+                    break
+                except PermissionError:
+                    continue
+            else:
+                raise RuntimeError(
+                    f"原文件及98个更新文件都被占用，无法保存：{path}"
+                )
+        log(f"[输出诊断] {path.name}正被占用，已另存为{fallback.name}")
+        return fallback
+
+
 def write_station_workbook(
     output_dir: Path,
     station: str,
@@ -4141,7 +7437,13 @@ def write_station_workbook(
 
     matrix = workbook.create_sheet("月日矩阵")
     matrix.merge_cells("A1:M1")
-    title_bits = [heading.get("table_number", ""), heading.get("river", ""), station, "逐日平均流量表"]
+    title_bits = [
+        heading.get("table_number", ""),
+        heading.get("river", ""),
+        station,
+        heading.get("flow_scope", ""),
+        "逐日平均流量表",
+    ]
     matrix["A1"] = "  ".join(bit for bit in title_bits if bit)
     matrix["A1"].font = Font(bold=True, size=16, color="1F2937")
     matrix["A1"].alignment = Alignment(horizontal="center")
@@ -4289,8 +7591,7 @@ def write_station_workbook(
     pending.sheet_view.showGridLines = False
 
     workbook_path = output_dir / f"{safe_filename(output_name)}.xlsx"
-    workbook.save(workbook_path)
-    return workbook_path
+    return save_workbook_with_lock_fallback(workbook, workbook_path)
 
 
 def station_output_name(station: str, occurrence: int, total: int) -> str:
@@ -4408,8 +7709,7 @@ def write_training_review_workbook(
         sheet.column_dimensions[get_column_letter(index)].width = width
     sheet.sheet_view.showGridLines = False
     path = training_dir / "labels_review.xlsx"
-    workbook.save(path)
-    return path
+    return save_workbook_with_lock_fallback(workbook, path)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -4447,6 +7747,56 @@ def build_parser() -> argparse.ArgumentParser:
         help="可选的labels_review校正工作簿",
     )
     return parser
+
+
+def build_table_failure_payload(
+    region: TableRegion,
+    stage: str,
+    error: BaseException,
+    render_width: int,
+) -> dict[str, Any]:
+    """Create a durable diagnostic when one table fails independently."""
+
+    return {
+        "page": region.page,
+        "table_index": region.table_index,
+        "stage": stage,
+        "error_type": type(error).__name__,
+        "message": str(error),
+        "render_width": int(render_width),
+        "source_bbox": [int(value) for value in region.source_bbox],
+        "source_rules": [int(value) for value in region.source_rules],
+        "observed_rule_flags": [bool(value) for value in region.observed_rule_flags],
+        "boundary_scan_limits": region.diagnostics.get(
+            "boundary_scan_limits", []
+        ),
+        "region_diagnostics": dict(region.diagnostics),
+        "traceback": traceback.format_exc().splitlines()[-24:],
+    }
+
+
+def build_page_detection_failure_payload(
+    page_number: int,
+    detection: TableRegionDetection,
+    render_width: int,
+) -> dict[str, Any]:
+    """Record a missing table without aborting the remaining PDF pages."""
+
+    return {
+        "page": int(page_number),
+        "table_index": 0,
+        "stage": "table_detection",
+        "error_type": "RuntimeError",
+        "message": (
+            f"第{page_number}页没有检测到由14条竖线组成的逐日流量表。"
+        ),
+        "render_width": int(render_width),
+        "candidate_group_count": int(detection.candidate_group_count),
+        "strong_rejected_candidate_count": int(
+            detection.strong_rejected_candidate_count
+        ),
+        "rejected_groups": list(detection.rejected_groups),
+    }
 
 
 def main() -> None:
@@ -4497,19 +7847,51 @@ def main() -> None:
     all_rows: list[dict[str, Any]] = []
     all_samples: list[dict[str, Any]] = []
     dataset_groups: dict[str, dict[str, Any]] = {}
+    table_failures: list[dict[str, Any]] = []
 
     for page_index in range(page_count):
         page_number = page_index + 1
         log(f"[2/4] 渲染并定位第{page_number}/{page_count}页")
         source_image = render_pdf_page(pdf_path, page_index, args.render_width)
-        regions = detect_table_regions(source_image, page_number)
-        if len(regions) > 1 and args.render_width < 2200:
+        region_detection = detect_table_regions_with_diagnostics(
+            source_image, page_number
+        )
+        regions = region_detection.regions
+        initial_region_count = len(regions)
+        needs_resolution_probe = bool(
+            not regions
+            or region_detection.strong_rejected_candidate_count > 0
+        )
+        if needs_resolution_probe and args.render_width < 2200:
             log(
-                f"[2/4] 第{page_number}页为照片多表页，"
-                "自动提高到2200像素宽以保留小号数字"
+                f"[2/4] 第{page_number}页初检得到{len(regions)}张表、"
+                f"{region_detection.strong_rejected_candidate_count}个"
+                "强候选未通过，自动提高到2200像素宽复检"
             )
-            source_image = render_pdf_page(pdf_path, page_index, 2200)
-            regions = detect_table_regions(source_image, page_number)
+            high_resolution_image = render_pdf_page(
+                pdf_path, page_index, 2200
+            )
+            high_resolution_detection = (
+                detect_table_regions_with_diagnostics(
+                    high_resolution_image, page_number
+                )
+            )
+            if len(high_resolution_detection.regions) > len(regions):
+                source_image = high_resolution_image
+                region_detection = high_resolution_detection
+                regions = region_detection.regions
+                log(
+                    f"[2/4] 第{page_number}页采用2200像素结果："
+                    f"表数由{initial_region_count}"
+                    f"提升到{len(regions)}张。"
+                )
+            else:
+                log(
+                    f"[2/4] 第{page_number}页高分辨率没有增加完整表区，"
+                    "保留原分辨率结果，避免无条件放大改变锚点节奏。"
+                )
+        if regions:
+            assign_region_boundary_scan_limits(regions, source_image.shape[0])
         cv2.imwrite(
             str(structure_dir / f"page_{page_number:03d}_source.png"), source_image
         )
@@ -4521,22 +7903,76 @@ def main() -> None:
                     source_image, geometry, primary_recognizer
                 )
                 work_items.append((source_image, geometry, heading, "original"))
-            except RuntimeError:
-                pass
+            except RuntimeError as direct_error:
+                log(
+                    f"[表区诊断] 第{page_number}页直线网格路径未通过："
+                    f"{direct_error}；改用非刚性曲线网格。"
+                )
         if not work_items:
             if not regions:
-                raise RuntimeError(
-                    f"第{page_number}页没有检测到由14条竖线组成的逐日流量表。"
+                failure = build_page_detection_failure_payload(
+                    page_number,
+                    region_detection,
+                    source_image.shape[1],
                 )
+                table_failures.append(failure)
+                failure_path = structure_dir / (
+                    f"page_{page_number:03d}_detection_failure.json"
+                )
+                failure_path.write_text(
+                    json.dumps(failure, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                draw_source_curve_mesh_preview(
+                    source_image,
+                    [],
+                    previews_dir
+                    / f"page_{page_number:03d}_source_curve_mesh.png",
+                )
+                log(
+                    f"[表区失败] 第{page_number}页没有完整表区，"
+                    f"已记录诊断并继续下一页：{failure_path}"
+                )
+                continue
             for region in regions:
-                rectified = rectify_table_region(source_image, region)
-                region.image = rectified
-                geometry = detect_rectified_geometry(rectified, region)
-                heading = recognize_region_heading(
-                    source_image, region, primary_recognizer
-                )
-                work_items.append((rectified, geometry, heading, "photo-dewarped"))
+                stage = "rectification"
+                try:
+                    rectified = rectify_table_region(source_image, region)
+                    region.image = rectified
+                    stage = "geometry"
+                    geometry = detect_rectified_geometry(rectified, region)
+                    stage = "heading"
+                    heading = recognize_region_heading(
+                        source_image, region, primary_recognizer
+                    )
+                    work_items.append(
+                        (rectified, geometry, heading, "photo-dewarped")
+                    )
+                except Exception as error:
+                    failure = build_table_failure_payload(
+                        region, stage, error, source_image.shape[1]
+                    )
+                    table_failures.append(failure)
+                    failure_path = structure_dir / (
+                        f"page_{page_number:03d}_table_"
+                        f"{region.table_index:02d}_failure.json"
+                    )
+                    failure_path.write_text(
+                        json.dumps(failure, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                    log(
+                        f"[表区失败] 第{page_number}页表{region.table_index}"
+                        f"在{stage}阶段失败：{error}；"
+                        f"诊断={failure_path}"
+                    )
+                    continue
 
+        draw_source_curve_mesh_preview(
+            source_image,
+            regions,
+            previews_dir / f"page_{page_number:03d}_source_curve_mesh.png",
+        )
         log(f"[2/4] 第{page_number}页检测到{len(work_items)}张站表")
         for table_image, geometry, heading, geometry_mode in work_items:
             table_index = geometry.table_index
@@ -4546,16 +7982,57 @@ def main() -> None:
                 f"{len(geometry.candidate_anchors)}，最终锚点="
                 f"{len(geometry.row_anchors)}"
             )
-            rows, samples, month_lengths = recognize_daily_cells(
-                table_image,
-                geometry,
-                heading,
-                primary_recognizer,
-                secondary_recognizer,
-                training_images_dir,
-                args.batch_size,
-                args.low_confidence,
-            )
+            try:
+                rows, samples, month_lengths = recognize_daily_cells(
+                    table_image,
+                    geometry,
+                    heading,
+                    primary_recognizer,
+                    secondary_recognizer,
+                    training_images_dir,
+                    args.batch_size,
+                    args.low_confidence,
+                )
+            except Exception as error:
+                matching_region = next(
+                    (
+                        item
+                        for item in regions
+                        if item.table_index == table_index
+                    ),
+                    None,
+                )
+                if matching_region is not None:
+                    failure = build_table_failure_payload(
+                        matching_region,
+                        "cell_recognition",
+                        error,
+                        source_image.shape[1],
+                    )
+                else:
+                    failure = {
+                        "page": page_number,
+                        "table_index": table_index,
+                        "stage": "cell_recognition",
+                        "error_type": type(error).__name__,
+                        "message": str(error),
+                        "render_width": source_image.shape[1],
+                        "traceback": traceback.format_exc().splitlines()[-24:],
+                    }
+                table_failures.append(failure)
+                failure_path = structure_dir / (
+                    f"page_{page_number:03d}_table_"
+                    f"{table_index:02d}_failure.json"
+                )
+                failure_path.write_text(
+                    json.dumps(failure, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                log(
+                    f"[表区失败] 第{page_number}页表{table_index}"
+                    f"在单元格识别阶段失败：{error}；诊断={failure_path}"
+                )
+                continue
             geometry_json = geometry_to_json(geometry)
             geometry_json["heading"] = heading
             geometry_json["month_lengths"] = month_lengths
@@ -4713,12 +8190,20 @@ def main() -> None:
         )
     review_path = write_training_review_workbook(all_samples, training_dir)
     manifest_path = output_dir / f"{pdf_path.stem}_stations.json"
+    run_status = (
+        "complete"
+        if not table_failures
+        else ("partial" if dataset_groups else "failed")
+    )
     manifest_path.write_text(
         json.dumps(
             {
                 "input_pdf": str(pdf_path),
+                "status": run_status,
                 "station_count": len(station_totals),
                 "dataset_count": len(dataset_groups),
+                "failed_table_count": len(table_failures),
+                "failures": table_failures,
                 "stations": manifest_stations,
             },
             ensure_ascii=False,
@@ -4727,9 +8212,10 @@ def main() -> None:
         encoding="utf-8",
     )
     log(
-        f"[4/4] 完成：{len(station_totals)}个站点，"
+        f"[4/4] {run_status}：{len(station_totals)}个站点，"
         f"{len(dataset_groups)}张年度表，"
-        f"{len(all_rows)}条逐日流量"
+        f"{len(all_rows)}条逐日流量，"
+        f"{len(table_failures)}张表失败"
     )
     for item in manifest_stations:
         log(f"[完成] {item['output_name']} Excel：{item['excel']}")
@@ -4737,6 +8223,10 @@ def main() -> None:
     log(f"[完成] 锚点/分格预览：{previews_dir}")
     log(f"[完成] 标签校正表：{review_path}")
     log(f"[完成] 站点清单：{manifest_path}")
+    if not dataset_groups:
+        raise RuntimeError(
+            f"没有任何站表完成处理；已保存{len(table_failures)}份失败诊断。"
+        )
 
 
 if __name__ == "__main__":
